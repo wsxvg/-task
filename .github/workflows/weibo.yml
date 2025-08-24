@@ -1,0 +1,50 @@
+
+name: 微博定时检测上新
+
+on:
+  schedule:
+    # 北京时间 12:00 -> UTC 04:00 -> 提前15分钟 -> UTC 03:45
+    - cron: '45 03 * * *'
+    # 北京时间 16:00 -> UTC 08:00 -> 提前15分钟 -> UTC 07:45
+    - cron: '45 07 * * *'
+    # 北京时间 18:00 -> UTC 10:00 -> 提前15分钟 -> UTC 09:45
+    - cron: '45 09 * * *'
+    # 北京时间 19:00 -> UTC 11:00 -> 提前15分钟 -> UTC 10:45
+    - cron: '45 10 * * *'
+    # 北京时间 22:00 -> UTC 14:00 -> 提前15分钟 -> UTC 13:45
+    - cron: '45 13 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: weibo-check
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests pillow pytz lunardate
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - name: Run Weibo Parser
+      run: |
+        python weibo_parser.py
+      env:
+        TZ: Asia/Shanghai
+        WEIBO_SUB_COOKIE: ${{ secrets.WEIBO_SUB_COOKIE }}
