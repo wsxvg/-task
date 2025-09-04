@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V3.2 (两全其美最终版)
+微博API数据解析器 V3.4 (真实链接解析最终版)
 
 核心改进:
-- 【智能Cookie加载】程序会自动判断运行环境：
-  1. 优先尝试从环境变量 `WEIBO_SUB_COOKIE` 读取 (适配 GitHub Actions)。
-  2. 如果环境变量不存在，则自动从同目录下的 `cookie.txt` 文件读取 (方便本地运行)。
-- 集成了数据驱动的智能评分算法、并行获取全文、智能分页等所有最终功能。
+- 【真实链接解析】自动从帖子中提取 t.cn 短链接，并获取其重定向后的真实商品链接。
+- 【推送内容升级】在推送到企业微信的消息末尾，会自动附上解析出的真实链接，方便直接点击。
+- 保留了V3.3.1的所有功能：智能时间窗口、智能评分、图片防盗链、并行加载、灵活Cookie管理。
 """
 
 import json
@@ -32,15 +31,16 @@ except ImportError:
     Image = None
 
 # --- 全局配置 ---
-MAX_WORKERS = 10 # 并行获取全文的线程数
-SUB_COOKIE = None # 全局变量，脚本启动时会自动填充
-GROUP_ID = '5159683220312291' # 您的微博分组ID
-PAGE_LIMIT = 20 # 安全起见，最多翻20页
+MAX_WORKERS = 10 
+SUB_COOKIE = None 
+GROUP_ID = '5159683220312291'
+PAGE_LIMIT = 20
 
 # ---------------------------------------------------------------------------
 # 全新的、基于您标注数据训练的智能评分检测器
 # ---------------------------------------------------------------------------
 class SmartLaunchDetector:
+    # ... (此类与V3.3.1完全相同)
     def __init__(self):
         self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10}
         self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30, r'\d{1,2}月\d{1,2}日': 30, r'\d{1,2}号': 25, r'周[一二三四五六日]': 25}
@@ -73,6 +73,7 @@ class WeiboDataParser:
         self.launch_detector = SmartLaunchDetector()
 
     def _fetch_full_text(self, post_id: str) -> Optional[Dict[str, Any]]:
+        # ... (此函数与V3.3.1相同)
         time.sleep(random.uniform(0.3, 0.8))
         url = "https://weibo.com/ajax/statuses/longtext"
         params = {'id': post_id}
@@ -89,8 +90,33 @@ class WeiboDataParser:
                     return {'post_id': post_id, 'full_text': clean_text.strip()}
         except Exception: pass
         return {'post_id': post_id, 'full_text': None}
+        
+    def _resolve_short_link(self, short_link: str) -> Optional[str]:
+        """【新增】解析单个短链接，获取真实地址"""
+        try:
+            # 使用 HEAD 请求更快，因为我们只需要响应头
+            response = requests.head(short_link, allow_redirects=True, timeout=10)
+            return response.url
+        except Exception:
+            return None # 解析失败
+
+    def _extract_and_resolve_links(self, text: str) -> List[str]:
+        """【新增】从文本中提取所有 t.cn 链接并并行解析"""
+        short_links = re.findall(r'https?://t\.cn/\w+', text)
+        if not short_links:
+            return []
+        
+        real_links = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_link = {executor.submit(self._resolve_short_link, link): link for link in set(short_links)}
+            for future in as_completed(future_to_link):
+                real_link = future.result()
+                if real_link:
+                    real_links.append(real_link)
+        return real_links
 
     def parse_and_enrich(self, statuses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # ... (此函数与V3.3.1相同)
         long_text_posts = [post for post in statuses if post.get('isLongText')]
         full_texts = {}
         if long_text_posts:
@@ -99,25 +125,24 @@ class WeiboDataParser:
                 future_to_id = {executor.submit(self._fetch_full_text, post['idstr']): post['idstr'] for post in long_text_posts}
                 for future in as_completed(future_to_id):
                     result = future.result()
-                    if result and result.get('full_text'):
-                        full_texts[result['post_id']] = result['full_text']
+                    if result and result.get('full_text'): full_texts[result['post_id']] = result['full_text']
         
         parsed_statuses = []
         for status in statuses:
             if status.get('readtimetype') == 'adMblog': continue
-            
             post_id = status.get('idstr')
-            if post_id in full_texts:
-                status['text_raw'] = full_texts[post_id]
-
+            if post_id in full_texts: status['text_raw'] = full_texts[post_id]
             parsed_status = self._parse_single_status(status)
             if parsed_status:
+                # 【核心升级】在解析完成后，为每条帖子自动解析真实链接
+                parsed_status['real_links'] = self._extract_and_resolve_links(parsed_status['text_raw'])
                 parsed_statuses.append(parsed_status)
         return parsed_statuses
 
     def filter_launch_posts(self, parsed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [post for post in parsed_data if self.launch_detector.check(post.get('text_raw', ''))]
 
+    # ... (其余解析函数与V3.3.1相同)
     def _parse_single_status(self, status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             is_retweet = 'retweeted_status' in status
@@ -130,38 +155,33 @@ class WeiboDataParser:
             if is_retweet:
                 original_user_info = self._parse_user_info(original_status.get('user', {}))
                 basic_info['original_text_raw'] = original_status.get('text_raw', '')
-            
             return {**basic_info, 'user': user_info, 'interaction': interaction_data, 'media': media_content, 'original_user': original_user_info}
         except Exception: return None
-
-    def _parse_basic_info(self, status: Dict[str, Any], is_retweet: bool) -> Dict[str, Any]:
-        return {'id': status.get('idstr', status.get('id')), 'text_raw': status.get('text_raw', ''), 'created_at': self._parse_time(status.get('created_at')), 'source': self._clean_source(status.get('source', '')), 'is_retweet': is_retweet}
-    def _parse_user_info(self, user: Dict[str, Any]) -> Dict[str, Any]:
-        return {'screen_name': user.get('screen_name', ''), 'user_id': user.get('idstr', user.get('id', '')), 'profile_image_url': user.get('profile_image_url', ''), 'followers_count': user.get('followers_count', 0), 'verified': user.get('verified', False), 'description': user.get('description', '')}
-    def _parse_interaction_data(self, status: Dict[str, Any]) -> Dict[str, Any]:
-        return {'reposts_count': status.get('reposts_count', 0), 'comments_count': status.get('comments_count', 0), 'attitudes_count': status.get('attitudes_count', 0)}
+    def _parse_basic_info(self, s, r): return {'id': s.get('idstr', s.get('id')), 'text_raw': s.get('text_raw', ''), 'created_at': self._parse_time(s.get('created_at')), 'source': self._clean_source(s.get('source', '')), 'is_retweet': r}
+    def _parse_user_info(self, u): return {'screen_name': u.get('screen_name', ''), 'user_id': u.get('idstr', u.get('id', '')), 'profile_image_url': u.get('profile_image_url', ''), 'followers_count': u.get('followers_count', 0), 'verified': u.get('verified', False), 'description': u.get('description', '')}
+    def _parse_interaction_data(self, s): return {'reposts_count': s.get('reposts_count', 0), 'comments_count': s.get('comments_count', 0), 'attitudes_count': s.get('attitudes_count', 0)}
     def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
-        images = []
+        media = {'images': [], 'videos': []}
         pic_infos = status.get('pic_infos', {})
         for pic_id in status.get('pic_ids', []):
             if pic_id in pic_infos:
                 for size in ['large', 'original', 'bmiddle']:
-                    if size in pic_infos[pic_id] and 'url' in pic_infos[pic_id][size]:
-                        images.append({'url': pic_infos[pic_id][size]['url']})
-                        break
-        return {'images': images, 'videos': []}
-    def _parse_time(self, time_str: Optional[str]) -> str:
+                    if size in pic_infos[pic_id] and 'url' in pic_infos[pic_id][size]: media['images'].append({'url': pic_infos[pic_id][size]['url']}); break
+        if 'page_info' in status and status['page_info'].get('type') == 'video':
+            page_pic_url = status['page_info'].get('page_pic', {}).get('url')
+            if page_pic_url: media['images'].append({'url': page_pic_url})
+        return media
+    def _parse_time(self, t):
         try:
-            if time_str: return datetime.strptime(time_str, "%a %b %d %H:%M:%S %z %Y").strftime("%Y-%m-%d %H:%M:%S")
+            if t: return datetime.strptime(t, "%a %b %d %H:%M:%S %z %Y").strftime("%Y-%m-%d %H:%M:%S")
         except Exception: pass
-        return time_str or ""
-    def _clean_source(self, source: str) -> str:
-        return re.sub(r'<[^>]+>', '', source).strip()
-
+        return t or ""
+    def _clean_source(self, s): return re.sub(r'<[^>]+>', '', s).strip()
     def download_and_convert_image(self, image_url: str) -> Optional[Dict[str, str]]:
         if not Image: return None
         try:
-            response = requests.get(image_url, timeout=10)
+            headers = {'Referer': 'https://weibo.com/','User-Agent': 'Mozilla/5.0'}
+            response = requests.get(image_url, headers=headers, timeout=10)
             if response.status_code != 200: return None
             image_data = response.content
             if len(image_data) > 2 * 1024 * 1024:
@@ -172,7 +192,6 @@ class WeiboDataParser:
                 image_data = buffer.getvalue()
             return {'base64': base64.b64encode(image_data).decode('utf-8'), 'md5': hashlib.md5(image_data).hexdigest()}
         except Exception: return None
-    
     def send_wechat_text(self, text: str) -> bool:
         if not self.webhook_url: return False
         try:
@@ -180,7 +199,6 @@ class WeiboDataParser:
             response = requests.post(self.webhook_url, json=data, timeout=10)
             return response.json().get('errcode') == 0
         except Exception: return False
-        
     def send_wechat_image(self, image_info: Dict[str, str]) -> bool:
         if not self.webhook_url: return False
         try:
@@ -194,62 +212,75 @@ class WeiboDataParser:
 # ---------------------------------------------------------------------------
 
 def fetch_weibo_data() -> List[Dict[str, Any]]:
-    beijing_tz = pytz.timezone('Asia/Shanghai')
-    now_beijing = datetime.now(beijing_tz)
-    start_time = now_beijing - timedelta(hours=6)
-    print(f"📅 设定抓取时间窗口: 过去6小时 (从 {start_time.strftime('%Y-%m-%d %H:%M:%S')} 开始)")
-    
-    all_statuses = []
-    max_id = None
-    
+    # ... (此函数与V3.3.1相同)
+    beijing_tz=pytz.timezone('Asia/Shanghai');now_beijing=datetime.now(beijing_tz);current_hour=now_beijing.hour
+    if 11<=current_hour<15:start_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0,microsecond=0);end_time=now_beijing.replace(hour=12,minute=0,second=0,microsecond=0);window_desc="昨天22:00 → 今天12:00"
+    elif 15<=current_hour<17:start_time=now_beijing.replace(hour=12,minute=0,second=0,microsecond=0);end_time=now_beijing.replace(hour=16,minute=0,second=0,microsecond=0);window_desc="今天12:00 → 今天16:00"
+    elif 17<=current_hour<18:start_time=now_beijing.replace(hour=16,minute=0,second=0,microsecond=0);end_time=now_beijing.replace(hour=18,minute=0,second=0,microsecond=0);window_desc="今天16:00 → 今天18:00"
+    elif 18<=current_hour<21:start_time=now_beijing.replace(hour=18,minute=0,second=0,microsecond=0);end_time=now_beijing.replace(hour=19,minute=0,second=0,microsecond=0);window_desc="今天18:00 → 今天19:00"
+    elif current_hour>=21 or current_hour<2:
+        if current_hour>=21:start_time=now_beijing.replace(hour=19,minute=0,second=0,microsecond=0);end_time=now_beijing.replace(hour=22,minute=0,second=0,microsecond=0)
+        else:start_time=(now_beijing-timedelta(days=1)).replace(hour=19,minute=0,second=0,microsecond=0);end_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0,microsecond=0)
+        window_desc="今天19:00 → 今天22:00"
+    else:start_time=now_beijing-timedelta(hours=6);end_time=now_beijing;window_desc="最近6小时"
+    print(f"📅 设定抓取时间窗口: {window_desc}");all_window_statuses=[];max_id=None
     for page in range(PAGE_LIMIT):
         print(f"🚀 正在抓取微博列表 (第 {page+1} 页)...")
-        url = "https://weibo.com/ajax/feed/groupstimeline"
-        params = {'list_id': GROUP_ID, 'count': '50'}
-        if max_id: params['max_id'] = max_id
-        headers = {'accept': 'application/json, text/plain, */*','x-requested-with': 'XMLHttpRequest','user-agent': 'Mozilla/5.0'}
-        cookies = {'SUB': SUB_COOKIE}
+        url="https://weibo.com/ajax/feed/groupstimeline";params={'list_id':GROUP_ID,'count':'50'}
+        if max_id:params['max_id']=max_id
+        headers={'accept':'application/json, text/plain, */*','x-requested-with':'XMLHttpRequest','user-agent':'Mozilla/5.0'}
+        cookies={'SUB':SUB_COOKIE}
         try:
-            response = requests.get(url, params=params, headers=headers, cookies=cookies, timeout=15)
-            data = response.json()
-            statuses = data.get('statuses', [])
-            if not statuses: 
-                print("ℹ️ 已加载到最后一页。")
-                break
-            
-            last_post_time = datetime.strptime(statuses[-1]['created_at'], "%a %b %d %H:%M:%S %z %Y")
-            if last_post_time < start_time:
-                relevant_posts = [s for s in statuses if datetime.strptime(s['created_at'], "%a %b %d %H:%M:%S %z %Y") >= start_time]
-                all_statuses.extend(relevant_posts)
-                break
-            all_statuses.extend(statuses)
-            max_id = data.get('max_id_str')
-            if not max_id or max_id == "0": break
+            response=requests.get(url,params=params,headers=headers,cookies=cookies,timeout=15)
+            data=response.json();statuses=data.get('statuses',[])
+            if not statuses:break
+            found_old_post=False
+            for status in statuses:
+                try:
+                    post_time=datetime.strptime(status['created_at'],"%a %b %d %H:%M:%S %z %Y")
+                    if start_time<=post_time<=end_time:all_window_statuses.append(status)
+                    elif post_time<start_time:found_old_post=True
+                except(ValueError,KeyError):continue
+            if found_old_post:print("ℹ️ 帖子时间已早于窗口，停止翻页。");break
+            max_id=data.get('max_id_str')
+            if not max_id or max_id=="0":break
             time.sleep(1)
-        except Exception as e:
-            print(f"❌ 抓取第 {page+1} 页时出错: {e}")
-            break
-    return all_statuses
+        except Exception as e:print(f"❌ 抓取第 {page+1} 页时出错: {e}");break
+    return all_window_statuses
 
 def _clean_content_for_wechat(content: str) -> str:
-    cleaned = re.sub(r'https?://t\.cn/\w+|网页链接', '', content)
-    return re.sub(r'\s+', ' ', cleaned).strip()
+    # 保留短链接，因为我们会在后面附上真实链接
+    return re.sub(r'\s+', ' ', content).strip()
 
 def format_launch_notification(launch_info: Dict[str, Any]) -> str:
+    """【核心升级】在推送消息中附上真实链接"""
     user_name = launch_info['user']['screen_name']
+    # 注意：这里不过滤短链接了，让用户能看到原文
     content = _clean_content_for_wechat(launch_info['text_raw'])
     if len(content) > 400: content = content[:400] + "..."
-    return f"🛍️【上新预告】{user_name}\n\n💬 {content}"
+    
+    message = f"🛍️【上新预告】{user_name}\n\n💬 {content}"
+    
+    real_links = launch_info.get('real_links', [])
+    if real_links:
+        message += "\n\n🔗 直达链接:"
+        for i, link in enumerate(real_links):
+            message += f"\n{i+1}. {link}"
+            
+    return message
 
 def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[str, Any]]):
     print(f"\n📨 开始推送 {len(launch_posts)} 条上新预告到企业微信...")
     for post in launch_posts:
+        # 解析真实链接的动作已经在 parse_and_enrich 中完成
+        # 现在我们只需要在格式化消息时使用它
         text_content = format_launch_notification(post)
+        
         if parser.send_wechat_text(text_content):
             print(f"   ✅ 文本推送成功: {post['user']['screen_name']}")
             time.sleep(1)
             images = post.get('media', {}).get('images', [])
-            for i, image in enumerate(images[:2]): # 最多发2张
+            for i, image in enumerate(images[:2]):
                 image_info = parser.download_and_convert_image(image['url'])
                 if image_info and parser.send_wechat_image(image_info):
                     print(f"      - 图片 {i+1} 发送成功")
@@ -261,17 +292,14 @@ def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[s
         time.sleep(2)
 
 def main(webhook_url: Optional[str] = None, enable_push: bool = True):
+    # ... (此函数与V3.3.1相同)
     global SUB_COOKIE
-    # 【核心升级】智能加载Cookie
-    SUB_COOKIE = os.getenv('WEIBO_SUB_COOKIE')
-    if SUB_COOKIE:
-        print("✅ 成功从环境变量加载 Cookie (GitHub Actions 模式)。")
+    SUB_COOKIE=os.getenv('WEIBO_SUB_COOKIE')
+    if SUB_COOKIE:print("✅ 成功从环境变量加载 Cookie (GitHub Actions 模式)。")
     else:
         try:
-            with open('cookie.txt', 'r', encoding='utf-8') as f:
-                SUB_COOKIE = f.read().strip()
-            if not SUB_COOKIE:
-                raise FileNotFoundError
+            with open('cookie.txt','r',encoding='utf-8')as f:SUB_COOKIE=f.read().strip()
+            if not SUB_COOKIE:raise FileNotFoundError
             print("✅ 成功从 cookie.txt 加载 Cookie (本地运行模式)。")
         except FileNotFoundError:
             print("❌ 致命错误: 未能加载 Cookie！")
@@ -279,54 +307,37 @@ def main(webhook_url: Optional[str] = None, enable_push: bool = True):
             print("  - 在本地运行, 请在脚本同目录下创建一个 `cookie.txt` 文件并填入 SUB Cookie。")
             return
 
-    start_time = datetime.now(pytz.timezone('Asia/Shanghai'))
+    start_time=datetime.now(pytz.timezone('Asia/Shanghai'))
     print(f"🚀 程序运行开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
-    
-    raw_statuses = fetch_weibo_data()
-    if not raw_statuses:
-        print("🏁 本次未抓取到任何微博，程序结束。")
-        return
-        
+    raw_statuses=fetch_weibo_data()
+    if not raw_statuses:print("🏁 本次未抓取到任何符合时间窗口的微博，程序结束。");return
     print(f"\n📊 抓取完成，共获得 {len(raw_statuses)} 条原始微博待处理。")
-    
-    parser = WeiboDataParser(webhook_url=webhook_url)
-    parsed_data = parser.parse_and_enrich(raw_statuses)
-    
-    print(f"🧠 已完成数据解析和全文获取，得到 {len(parsed_data)} 条有效帖子。")
-
+    parser=WeiboDataParser(webhook_url=webhook_url)
+    parsed_data=parser.parse_and_enrich(raw_statuses)
+    print(f"🧠 已完成数据解析和全文/链接获取，得到 {len(parsed_data)} 条有效帖子。")
     print("🔍 开始使用智能评分算法进行上新帖识别...")
-    launch_posts = parser.filter_launch_posts(parsed_data)
-
+    launch_posts=parser.filter_launch_posts(parsed_data)
     if launch_posts:
         print(f"✅ 识别成功！共找到 {len(launch_posts)} 条上新帖。")
-        for i, post in enumerate(launch_posts):
-            print(f"   {i+1}. {post['user']['screen_name']}: {post['text_raw'][:50]}...")
-        
-        if enable_push:
-            send_launch_notifications(parser, launch_posts)
-        else:
-            print("🚫 推送功能已禁用，跳过推送。")
-    else:
-        print("ℹ️ 本次运行未识别到任何上新帖。")
-    
+        for i,post in enumerate(launch_posts):print(f"   {i+1}. {post['user']['screen_name']}: {post['text_raw'][:50]}...")
+        if enable_push:send_launch_notifications(parser,launch_posts)
+        else:print("🚫 推送功能已禁用(--no-push)。")
+    else:print("ℹ️ 本次运行未识别到任何上新帖。")
     print("\n🏁 所有任务执行完毕。")
 
 if __name__ == "__main__":
     webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=5a9b8214-4fae-4bbd-a147-9ecfe5eb6d90"
     enable_push = True
     
-    if '--no-push' in sys.argv:
-        enable_push = False
+    if '--no-push' in sys.argv: enable_push = False
     if '--webhook' in sys.argv:
         try:
             webhook_index = sys.argv.index('--webhook') + 1
             webhook_url = sys.argv[webhook_index]
         except (ValueError, IndexError):
-            print("❌ 错误: --webhook 参数后需要提供一个URL。")
-            sys.exit(1)
+            print("❌ 错误: --webhook 参数后需要提供一个URL。"); sys.exit(1)
             
     env_webhook = os.getenv('WECHAT_WEBHOOK_URL')
-    if env_webhook:
-        webhook_url = env_webhook
+    if env_webhook: webhook_url = env_webhook
     
     main(webhook_url, enable_push)
