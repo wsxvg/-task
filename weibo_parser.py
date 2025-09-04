@@ -1,40 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器
-单文件版本 - 用于解析微博群组时间线API返回的JSON数据
-支持企业微信机器人推送
+微博API数据解析器 V3.2 (两全其美最终版)
 
-使用方法：
-1. 默认使用（自动推送到企业微信）：
-   python weibo_parser.py
-
-2. 只显示在控制台（不推送）：
-   python weibo_parser.py --no-push
-
-3. 使用自定义webhook URL：
-   python weibo_parser.py --webhook "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
-
-4. 通过环境变量覆盖：
-   set WECHAT_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY
-   python weibo_parser.py
-
-默认配置：
-- 企业微信机器人已预设配置
-- 自动推送今天的微博动态
-- 支持纯文本 + 图片模式
-
-功能特性：
-- 智能分页抓取，只获取今天的动态
-- 自动过滤广告/推广内容
-- 支持企业微信机器人推送（纯文本 + 图片）
-- 图片自动压缩（不超过2M）
-- 频率限制保护（20条/分钟）
-
-注意事项：
-- 需要安装 Pillow 库：pip install Pillow
-- 企业微信机器人已预设配置，可直接使用
-- 图片转换为base64可能需要一些时间
+核心改进:
+- 【智能Cookie加载】程序会自动判断运行环境：
+  1. 优先尝试从环境变量 `WEIBO_SUB_COOKIE` 读取 (适配 GitHub Actions)。
+  2. 如果环境变量不存在，则自动从同目录下的 `cookie.txt` 文件读取 (方便本地运行)。
+- 集成了数据驱动的智能评分算法、并行获取全文、智能分页等所有最终功能。
 """
 
 import json
@@ -48,1689 +21,312 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+import sys
+import time
+import random
 
 try:
     from PIL import Image
 except ImportError:
-    print("⚠️ 未安装 Pillow 库，图片功能将不可用")
-    print("请运行：pip install Pillow")
+    print("⚠️ 警告：未安装 Pillow 库，图片压缩功能将不可用。请运行: pip install Pillow")
     Image = None
 
+# --- 全局配置 ---
+MAX_WORKERS = 10 # 并行获取全文的线程数
+SUB_COOKIE = None # 全局变量，脚本启动时会自动填充
+GROUP_ID = '5159683220312291' # 您的微博分组ID
+PAGE_LIMIT = 20 # 安全起见，最多翻20页
 
+# ---------------------------------------------------------------------------
+# 全新的、基于您标注数据训练的智能评分检测器
+# ---------------------------------------------------------------------------
+class SmartLaunchDetector:
+    def __init__(self):
+        self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10}
+        self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30, r'\d{1,2}月\d{1,2}日': 30, r'\d{1,2}号': 25, r'周[一二三四五六日]': 25}
+        self.ACTION_KEYWORDS = {'上架': 30, '发售': 30, '释放': 25, '补货': 25, '现货': 25, '开启购买': 35, '开售': 30, '补出': 20, '上新': 20, '预售': 25}
+        self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30, '确认': -30, '开发': -40, '研究': -40, '还在': -20, '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10, '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20, '计划': -50, '预计': -30, '准备': -20, '快了': -20, '即将': -20, '近期': -30}
+        self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50, '觉得': -40, '喜欢吗': -50}
+        self.VETO_KEYWORDS = ['抽奖', '转发此微博']
+        self.SCORE_THRESHOLD = 45
+
+    def check(self, text: str) -> bool:
+        if not text: return False
+        for word in self.VETO_KEYWORDS:
+            if word in text and not any(action in text for action in self.ACTION_KEYWORDS): return False
+        time_score = max([v for w, v in self.STRONG_TIME_KEYWORDS.items() if w in text] or [0])
+        pattern_time_score = max([v for p, v in self.TIME_PATTERNS.items() if re.search(p, text)] or [0])
+        action_score = max([v for w, v in self.ACTION_KEYWORDS.items() if w in text] or [0])
+        negative_score = sum(v for w, v in self.NEGATIVE_KEYWORDS.items() if w in text)
+        polling_score = sum(v for w, v in self.POLLING_KEYWORDS.items() if w in text)
+        final_time_score = max(time_score, pattern_time_score)
+        if final_time_score == 0 or action_score == 0: return False
+        total_score = final_time_score + action_score + negative_score + polling_score
+        return total_score >= self.SCORE_THRESHOLD
+
+# ---------------------------------------------------------------------------
+# 核心数据解析与推送类
+# ---------------------------------------------------------------------------
 class WeiboDataParser:
-    """微博API数据解析器"""
-    
     def __init__(self, webhook_url: Optional[str] = None):
-        self.parsed_data = []
         self.webhook_url = webhook_url
-        
-        # 上新/发售识别的关键词库
-        self.time_triggers = {
-            # 相对时间
-            '今晚', '明晚', '明天', '后天', '今天', '现在', '即日起', '稍后',
-            # 星期
-            '周一', '周二', '周三', '周四', '周五', '周六', '周日',
-            '星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日',
-            # 时间点关键词
-            '点', ':', '：', '准时',
-            # 日期相关
-            '号', '日', '月', '久等了', '终于', '等待',
-            # 新增：更多时间表达
-            '这周', '本周', '下午', '晚上', '上午', '中午', '凌晨',
-            '刚刚', '马上', '立即', '即刻', '当下', '此时', '此刻'
-        }
-        
-        self.action_triggers = {
-            '上架', '发售', '预售', '释放', '开启', '开售', '补货', '现货',
-            '上新通知', '新款预告', '准备就绪', '开启预售', '提前购',
-            '会员先购', '非会员释放', 'VIP先购', 'vip先购', '先购',
-            '售罄不补', '限购', '现货直接释放',
-            '上新', '上新产品', '开放', '开放购买', '已开售',
-            '破价', '已释放', '出货', '已上架', '现货上架',
-            '上🆕', '🆕', '新品上市', '新款上线', '回馈价', '特价上架',
-            # 新增关键词来匹配更多场景
-            '做好啦', '久等了', '工艺', '做工', '升级', '完美', '到了',
-            # 新增：更多上新相关表达
-            '全新', '重磅上阵', '重磅归来', '新品首发', '首批',
-            '第一批', '第二批', '最新批次', '更新了', '新颜色',
-     '带来了', '带给大家'
-        }
-        
-        # 抽奖活动关键词（用于排除）
-        self.lottery_keywords = {
-            '抽奖', '抽', '转发', '活动', '赠送', '免费送', '福利',
-            '参与方式', '中奖', '获奖', '幸运', '随机', '名额'
-        }
-        
-    def is_product_launch_post(self, status: Dict[str, Any]) -> bool:
-        """
-        四阶段过滤：识别是否为上新/发售预告帖子
-        
-        阶段1: 必须同时包含时间类和动作类触发词
-        阶段2: 进一步的语义验证和时间有效性检查
-        阶段3: 排除纯抽奖活动（但允许上新+抽奖的混合情况）
-        阶段4: 智能语义分析增强（新增）
-        """
-        content = status.get('text_raw', '')
-        
-        if not content:
-            return False
-        
-        # 阶段1: 检查时间类触发词
-        has_time_trigger = self._has_time_trigger(content)
-        
-        # 阶段1: 检查动作类触发词
-        has_action_trigger = self._has_action_trigger(content)
-        
-        # 必须同时包含时间类和动作类触发词
-        if not (has_time_trigger and has_action_trigger):
-            return False
-        
-        # 阶段2: 排除纯预告类内容（没有实际上新行为）
-        if self._is_pure_preview(content):
-            return False
-        
-        # 阶段2: 排除时间久远的内容
-        if self._is_time_too_distant(content):
-            return False
-        
-        # 阶段3: 排除纯抽奖活动（但不排除上新+抽奖的混合情况）
-        if self._is_lottery_activity(content):
-            return False
-        
-        # 阶段4: 智能语义分析增强（新增）
-        if self._has_negative_signals(content):
-            return False
-            
-        # 阶段4: 增强上新信忁度检查（新增）
-        confidence_score = self._calculate_launch_confidence(content)
-        if confidence_score < 0.6:  # 信忁度阈值
-            return False
-        
-        return True
-    
-    def _has_time_trigger(self, content: str) -> bool:
-        """检查是否包含时间类触发词"""
-        # 检查直接关键词（排除误判）
-        for trigger in self.time_triggers:
-            if trigger in content:
-                # 特殊处理：排除“点点赞”、“点击”等误判
-                if trigger == '点' and ('点点赞' in content or '点击' in content or '点评' in content):
-                    continue
-                # 特殊处理：只有URL中的冒号不算时间触发词
-                if trigger in [':', '：'] and ('http' in content or 't.cn' in content) and len([t for t in self.action_triggers if t in content]) == 0:
-                    continue
-                return True
-        
-        # 检查日期模式（包含“日”或“号”）
-        import re
-        # 匹配如: 27日, 25号, 8.24号, 8/24日
-        date_pattern = r'\d+[.\/]?\d*[日号]'
-        if re.search(date_pattern, content):
-            return True
-        
-        # 匹配时间格式（如: 20:00, 19:30, 八点）
-        time_pattern = r'\d+[:：]\d{2}|[一-九十百千万]+点'
-        if re.search(time_pattern, content):
-            return True
-        
-        # 新增：更多时间表达模式
-        additional_time_patterns = [
-            r'下午\d+点',    # 下午3点
-            r'晚上\d+点',    # 晚上8点
-            r'上午\d+点',    # 上十10点
-            r'中午\d+点',    # 中升12点
-            r'\d+号上午',    # 25号上午
-            r'\d+号下午',    # 25号下午
-            r'\d+号晚上',    # 25号晚上
-        ]
-        
-        for pattern in additional_time_patterns:
-            if re.search(pattern, content):
-                return True
-            
-        return False
-    
-    def _has_action_trigger(self, content: str) -> bool:
-        """检查是否包含动作类触发词"""
-        for trigger in self.action_triggers:
-            if trigger in content:
-                return True
-        
-        # 特殊处理：检查emoji和特殊字符组合
-        import re
-        # 匹配如: 上🆕, 新🔥, 🔥新品等模式
-        emoji_patterns = [
-            r'上[🆕🔥⭐✨💫]',  # 上+各种表示新的emoji
-            r'[🆕🔥⭐✨💫]',    # 单独的新品emoji
-            r'新[🔥⭐✨💫品款]',  # 新+相关字符
-            r'\d+号.*上',      # 数字+号+上 (如: 31号后天上🆕)
-            r'后天.*上',       # 后天+上
-            r'明天.*上',       # 明天+上
-        ]
-        
-        for pattern in emoji_patterns:
-            if re.search(pattern, content):
-                return True
-                
-        return False
-    
-    def _is_pure_preview(self, content: str) -> bool:
-        """检查是否为纯预告内容（没有实际上新行为）"""
-        # 纯预告的特征：只有“预告”没有具体发售行为
-        preview_only_patterns = [
-            '新款预告',  # 单纯的新款预告
-        ]
-        
-        for pattern in preview_only_patterns:
-            if pattern in content:
-                # 检查是否有实际的发售行为关键词
-                action_keywords = ['上架', '发售', '释放', '开售', '补货', '开启', '现货']
-                has_real_action = any(keyword in content for keyword in action_keywords)
-                
-                # 如果只有预告没有实际行为，则认为是纯预告
-                if not has_real_action:
-                    return True
-        
-        return False
-    
-    def _is_time_too_distant(self, content: str) -> bool:
-        """检查时间是否过于久远（超过3天）"""
-        import re
-        
-        # 检查远期时间的模式
-        distant_patterns = [
-            r'下个月',  # 下个月
-            r'下月',    # 下月 
-            r'下周',    # 下周
-        ]
-        
-        for pattern in distant_patterns:
-            if re.search(pattern, content):
-                return True
-        
-        return False
-    
-    def _is_lottery_activity(self, content: str) -> bool:
-        """检查是否为纯抽奖活动内容（不包含真正的上新行为）"""
-        # 先检查是否有真正的上新动作关键词
-        real_launch_keywords = {
-            '上架', '发售', '预售', '释放', '开售', '补货', '现货',
-            '开启预售', '上新', '开放购买'
-        }
-        
-        # 如果包含真正的上新关键词，则不认为是纯抽奖活动
-        has_real_launch = any(keyword in content for keyword in real_launch_keywords)
-        if has_real_launch:
-            return False
-        
-        # 统计抽奖关键词出现次数
-        lottery_count = sum(1 for keyword in self.lottery_keywords if keyword in content)
-        
-        # 如果抽奖关键词较多，且没有真正的上新行为，则认为是纯抽奖活动
-        if lottery_count >= 2:
-            return True
-        
-        # 检查纯抽奖模式（没有上新内容的抽奖）
-        import re
-        pure_lottery_patterns = [
-            r'转发这条微博.*抽(?!上架|发售|预售|释放|开售)',  # 转发微博抽，但不是抽上架/发售
-            r'参与方式.*抽',        # 参与方式...抽
-            r'给.*准备了.*活动',    # 给粉丝准备了一个活动
-            r'绝对是.*纯活动',      # 绝对是很真实的纯活动
-        ]
-        
-        for pattern in pure_lottery_patterns:
-            if re.search(pattern, content):
-                return True
-        
-        return False
-    
-    def _has_negative_signals(self, content: str) -> bool:
-        """检查是否包含负面信号（新增）"""
-        import re
-        
-        # 负面信号列表
-        negative_signals = [
-            r'不会.*上架',  # "不会上架"
-            r'取消.*发售',  # "取消发售"
-            r'停止.*销售',  # "停止销售"
-            r'延迟.*上新',  # "延迟上新"
-            r'暂停.*发售',  # "暂停发售"
-            r'库存不足',    # 库存问题
-            r'售罄.*不补',  # 明确说明不补货
-            r'不做.*了',     # "不做这款了"
-        ]
-        
-        for pattern in negative_signals:
-            if re.search(pattern, content):
-                return True
-        
-        return False
-    
-    def _calculate_launch_confidence(self, content: str) -> float:
-        """计算上新信忁度分数（新增）"""
-        confidence = 0.5  # 基础分数
-        
-        # 正面信号加分
-        positive_signals = {
-            # 强烈上新信号 (+0.3)
-            '现货上架': 0.3, '已上架': 0.3, '已释放': 0.3,
-            '全新': 0.25, '首发': 0.25, '首批': 0.25,
-            # 中等上新信号 (+0.2) 
-            '久等了': 0.2, '终于': 0.2, '做好啦': 0.2,
-            '工艺': 0.15, '做工': 0.15, '升级': 0.15,
-            # 较弱上新信号 (+0.1)
-            '新款': 0.1, '新品': 0.1, '新颜色': 0.1,
-            '这次': 0.1, '这一次': 0.1
-        }
-        
-        for signal, score in positive_signals.items():
-            if signal in content:
-                confidence += score
-        
-        # 时间紧迫性加分
-        import re
-        urgent_time_patterns = [
-            r'今晚', r'明天', r'后天', r'马上', 
-            r'立即', r'现在', r'即刻'
-        ]
-        
-        for pattern in urgent_time_patterns:
-            if re.search(pattern, content):
-                confidence += 0.1
-                break  # 只加一次
-        
-        # 具体时间加分
-        specific_time_pattern = r'\d+[:]：\d{2}|\d+点|\d+号'
-        if re.search(specific_time_pattern, content):
-            confidence += 0.1
-        
-        # 产品类别加分（服装类关键词）
-        product_keywords = [
-            't恤', '卫衣', '外套', '裤子', '连衣裙',
-            '夏装', '冬装', '春装', '秋装', '新款'
-        ]
-        
-        product_count = sum(1 for keyword in product_keywords if keyword in content)
-        confidence += min(0.2, product_count * 0.05)  # 最多加0.2分
-        
-        return min(1.0, confidence)  # 上限为1.0
-    
-    def _clean_content_for_wechat(self, content: str) -> str:
-        """清理微信推送内容，删除短链接"""
-        import re
-        
-        # 删除各种短链接格式
-        link_patterns = [
-            r'https?://t\.cn/\w+',      # http://t.cn/xxx 或 https://t.cn/xxx
-            r't\.cn/\w+',               # t.cn/xxx
-            r'网页链接',                 # 微博中的“网页链接”文字
-            r'​+',                      # 删除多余的零宽字符
-        ]
-        
-        cleaned_content = content
-        for pattern in link_patterns:
-            cleaned_content = re.sub(pattern, '', cleaned_content)
-        
-        # 清理多余的空格和换行
-        cleaned_content = re.sub(r'\s+', ' ', cleaned_content).strip()
-        
-        return cleaned_content
-    
-    def extract_launch_info(self, status: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        提取上新帖子的结构化信息
-        """
-        content = status.get('text_raw', '')
-        user_name = status.get('user', {}).get('screen_name', '')
-        created_time = status.get('created_at', '')
-        post_id = status.get('id', '')
-        
-        # 提取匹配的关键词
-        matched_time_triggers = [t for t in self.time_triggers if t in content]
-        matched_action_triggers = [t for t in self.action_triggers if t in content]
-        
-        # 提取时间信息
-        time_info = self._extract_time_info(content)
-        
-        # 提取产品信息（简化版）
-        product_info = self._extract_product_info(content)
-        
-        # 直接使用已解析的媒体信息（如果已经解析过）
-        # 如果status包含media字段说明已经解析过，直接使用
-        if 'media' in status:
-            media_content = status['media']
-        else:
-            # 否则重新解析（针对原始数据）
-            media_content = self._parse_media_content(status)
-        
-        return {
-            'post_id': post_id,
-            'user_name': user_name,
-            'created_time': created_time,
-            'content': content,
-            'matched_time_triggers': matched_time_triggers,
-            'matched_action_triggers': matched_action_triggers,
-            'extracted_time': time_info,
-            'product_info': product_info,
-            'launch_type': self._classify_launch_type(matched_action_triggers),
-            'media': media_content  # 使用媒体信息
-        }
-    
-    def _extract_time_info(self, content: str) -> List[str]:
-        """提取时间信息"""
-        import re
-        time_patterns = []
-        
-        # 提取具体时间点 (20:00, 19:30等)
-        time_match = re.findall(r'\d{1,2}[:：]\d{2}', content)
-        time_patterns.extend(time_match)
-        
-        # 提取日期 (27日, 25号等)
-        date_match = re.findall(r'\d+[.\/]?\d*[日号]', content)
-        time_patterns.extend(date_match)
-        
-        # 提取相对时间
-        relative_times = [t for t in ['今晚', '明晚', '明天', '后天'] if t in content]
-        time_patterns.extend(relative_times)
-        
-        return time_patterns
-    
-    def _extract_product_info(self, content: str) -> str:
-        """简化的产品信息提取（取内容前100字符）"""
-        return content[:100] + '...' if len(content) > 100 else content
-    
-    def _classify_launch_type(self, action_triggers: List[str]) -> str:
-        """分类上新类型"""
-        if any(t in action_triggers for t in ['预售', '开启预售']):
-            return '预售'
-        elif any(t in action_triggers for t in ['补货', '现货']):
-            return '补货'
-        elif any(t in action_triggers for t in ['上架', '发售', '释放']):
-            return '正式发售'
-        else:
-            return '其他'
-    
-    def filter_launch_posts(self, parsed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """过滤出所有上新/发售预告帖子"""
-        launch_posts = []
-        
-        for post in parsed_data:
-            if self.is_product_launch_post(post):
-                launch_info = self.extract_launch_info(post)
-                launch_posts.append(launch_info)
-        
-        return launch_posts
-        
-    def parse_weibo_response(self, json_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        解析微博API响应数据
-        
-        Args:
-            json_data: 微博API返回的JSON数据
-            
-        Returns:
-            解析后的动态列表
-        """
-        if 'statuses' not in json_data:
-            return []
-        
-        statuses = json_data['statuses']
+        self.launch_detector = SmartLaunchDetector()
+
+    def _fetch_full_text(self, post_id: str) -> Optional[Dict[str, Any]]:
+        time.sleep(random.uniform(0.3, 0.8))
+        url = "https://weibo.com/ajax/statuses/longtext"
+        params = {'id': post_id}
+        headers = {'accept': 'application/json, text/plain, */*','x-requested-with': 'XMLHttpRequest','user-agent': 'Mozilla/5.0','referer': f'https://weibo.com/mygroups?gid={GROUP_ID}'}
+        cookies = {'SUB': SUB_COOKIE}
+        try:
+            response = requests.get(url, params=params, headers=headers, cookies=cookies, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('ok') == 1 and 'longTextContent' in data.get('data', {}):
+                    full_text = data['data']['longTextContent']
+                    clean_text = re.sub(r'<br\s*/?>', '\n', full_text)
+                    clean_text = re.sub(r'<.*?>', '', clean_text)
+                    return {'post_id': post_id, 'full_text': clean_text.strip()}
+        except Exception: pass
+        return {'post_id': post_id, 'full_text': None}
+
+    def parse_and_enrich(self, statuses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        long_text_posts = [post for post in statuses if post.get('isLongText')]
+        full_texts = {}
+        if long_text_posts:
+            print(f"⚡ 检测到 {len(long_text_posts)} 条长微博，开始并行获取全文...")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_id = {executor.submit(self._fetch_full_text, post['idstr']): post['idstr'] for post in long_text_posts}
+                for future in as_completed(future_to_id):
+                    result = future.result()
+                    if result and result.get('full_text'):
+                        full_texts[result['post_id']] = result['full_text']
         
         parsed_statuses = []
-        
-        for index, status in enumerate(statuses, 1):
-            # 检查是否为广告/推广内容
-            if self._is_promotion(status):
-                continue
+        for status in statuses:
+            if status.get('readtimetype') == 'adMblog': continue
             
+            post_id = status.get('idstr')
+            if post_id in full_texts:
+                status['text_raw'] = full_texts[post_id]
+
             parsed_status = self._parse_single_status(status)
             if parsed_status:
                 parsed_statuses.append(parsed_status)
-        
         return parsed_statuses
-    
-    def _is_promotion(self, status: Dict[str, Any]) -> bool:
-        """判断是否为广告/推广内容"""
-        # 检查promotion字段
-        if 'promotion' in status:
-            return True
-        
-        # 检查content_auth_info
-        content_auth_info = status.get('content_auth_info', {})
-        if content_auth_info.get('content_auth_title') == '荐读':
-            return True
-        
-        # 检查readtimetype
-        if status.get('readtimetype') == 'adMblog':
-            return True
-        
-        return False
-    
+
+    def filter_launch_posts(self, parsed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [post for post in parsed_data if self.launch_detector.check(post.get('text_raw', ''))]
+
     def _parse_single_status(self, status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """解析单条动态"""
         try:
-            # 检查是否为转发动态
             is_retweet = 'retweeted_status' in status
-            
-            # 如果是转发，获取原始内容
             original_status = status['retweeted_status'] if is_retweet else status
-            
-            # 基本信息
             basic_info = self._parse_basic_info(status, is_retweet)
-            
-            # 用户信息
             user_info = self._parse_user_info(status.get('user', {}))
-            
-            # 互动数据
             interaction_data = self._parse_interaction_data(status)
-            
-            # 媒体内容
             media_content = self._parse_media_content(original_status)
-            
-            # 如果是转发，解析原作者信息
             original_user_info = None
             if is_retweet:
                 original_user_info = self._parse_user_info(original_status.get('user', {}))
                 basic_info['original_text_raw'] = original_status.get('text_raw', '')
             
-            return {
-                **basic_info,
-                'user': user_info,
-                'interaction': interaction_data,
-                'media': media_content,
-                'original_user': original_user_info
-            }
-            
-        except Exception as e:
-            return None
-    
+            return {**basic_info, 'user': user_info, 'interaction': interaction_data, 'media': media_content, 'original_user': original_user_info}
+        except Exception: return None
+
     def _parse_basic_info(self, status: Dict[str, Any], is_retweet: bool) -> Dict[str, Any]:
-        """解析基本信息"""
-        return {
-            'id': status.get('idstr', status.get('id')),
-            'text_raw': status.get('text_raw', ''),
-            'created_at': self._parse_time(status.get('created_at')),
-            'source': self._clean_source(status.get('source', '')),
-            'is_retweet': is_retweet
-        }
-    
+        return {'id': status.get('idstr', status.get('id')), 'text_raw': status.get('text_raw', ''), 'created_at': self._parse_time(status.get('created_at')), 'source': self._clean_source(status.get('source', '')), 'is_retweet': is_retweet}
     def _parse_user_info(self, user: Dict[str, Any]) -> Dict[str, Any]:
-        """解析用户信息"""
-        return {
-            'screen_name': user.get('screen_name', ''),
-            'user_id': user.get('idstr', user.get('id', '')),
-            'profile_image_url': user.get('profile_image_url', ''),
-            'followers_count': user.get('followers_count', 0),
-            'verified': user.get('verified', False),
-            'description': user.get('description', '')
-        }
-    
+        return {'screen_name': user.get('screen_name', ''), 'user_id': user.get('idstr', user.get('id', '')), 'profile_image_url': user.get('profile_image_url', ''), 'followers_count': user.get('followers_count', 0), 'verified': user.get('verified', False), 'description': user.get('description', '')}
     def _parse_interaction_data(self, status: Dict[str, Any]) -> Dict[str, Any]:
-        """解析互动数据"""
-        return {
-            'reposts_count': status.get('reposts_count', 0),
-            'comments_count': status.get('comments_count', 0),
-            'attitudes_count': status.get('attitudes_count', 0)
-        }
-    
+        return {'reposts_count': status.get('reposts_count', 0), 'comments_count': status.get('comments_count', 0), 'attitudes_count': status.get('attitudes_count', 0)}
     def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
-        """解析媒体内容（图片/视频）"""
-        media_content = {
-            'images': [],
-            'videos': []
-        }
-        
-        # 获取图片信息
-        pic_ids = status.get('pic_ids', [])
+        images = []
         pic_infos = status.get('pic_infos', {})
-        
-        for pic_id in pic_ids:
+        for pic_id in status.get('pic_ids', []):
             if pic_id in pic_infos:
-                pic_info = pic_infos[pic_id]
-                
-                # 获取图片URL（优先large，其次original）
-                image_url = self._get_best_image_url(pic_info)
-                
-                if image_url:
-                    image_data = {
-                        'pic_id': pic_id,
-                        'url': image_url,
-                        'width': pic_info.get('large', {}).get('geo', {}).get('width', 0),
-                        'height': pic_info.get('large', {}).get('geo', {}).get('height', 0)
-                    }
-                    media_content['images'].append(image_data)
-                
-                # 检查是否有视频（Live Photo等）
-                if 'video' in pic_info:
-                    video_url = pic_info['video']
-                    video_data = {
-                        'pic_id': pic_id,
-                        'url': video_url,
-                        'type': 'live_photo'
-                    }
-                    media_content['videos'].append(video_data)
-        
-        # 处理视频封面图片（page_pic字段）
-        page_pic = status.get('page_pic')
-        if page_pic:
-            # 生成一个虚拟的pic_id用于视频封面
-            video_cover_id = f"video_cover_{status.get('id', 'unknown')}"
-            
-            # 获取视频封面的尺寸信息（优先从pic_info获取）
-            pic_info_data = status.get('pic_info', {})
-            width = 540  # 默认宽度
-            height = 960  # 默认高度
-            
-            # 尝试从pic_info获取准确尺寸
-            if pic_info_data:
-                for size_key in ['pic_big', 'pic_middle', 'pic_small']:
-                    if size_key in pic_info_data:
-                        size_info = pic_info_data[size_key]
-                        try:
-                            width = int(size_info.get('width', width))
-                            height = int(size_info.get('height', height))
-                            break
-                        except (ValueError, TypeError):
-                            continue
-            
-            video_cover_data = {
-                'pic_id': video_cover_id,
-                'url': page_pic,
-                'width': width,
-                'height': height,
-                'is_video_cover': True  # 标记这是视频封面
-            }
-            media_content['images'].append(video_cover_data)
-            
-            # 如果有视频URL，也添加到videos列表
-            page_url = status.get('page_url', '')
-            if page_url and ('video' in page_url.lower() or 'containerid' in page_url):
-                video_data = {
-                    'pic_id': video_cover_id,
-                    'url': page_url,
-                    'type': 'weibo_video',
-                    'cover_url': page_pic
-                }
-                media_content['videos'].append(video_data)
-        
-        return media_content
-    
-    def _get_best_image_url(self, pic_info: Dict[str, Any]) -> Optional[str]:
-        """获取最佳质量的图片URL"""
-        # 优先级: original > large > bmiddle > small
-        for size in ['original', 'large', 'bmiddle', 'small']:
-            if size in pic_info and 'url' in pic_info[size]:
-                return pic_info[size]['url']
-        return None
-    
+                for size in ['large', 'original', 'bmiddle']:
+                    if size in pic_infos[pic_id] and 'url' in pic_infos[pic_id][size]:
+                        images.append({'url': pic_infos[pic_id][size]['url']})
+                        break
+        return {'images': images, 'videos': []}
     def _parse_time(self, time_str: Optional[str]) -> str:
-        """解析时间格式"""
         try:
-            if time_str:
-                # 微博时间格式: "Wed Jan 09 12:34:56 +0800 2025"
-                dt = datetime.strptime(time_str, "%a %b %d %H:%M:%S %z %Y")
-                return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception as e:
-            pass
+            if time_str: return datetime.strptime(time_str, "%a %b %d %H:%M:%S %z %Y").strftime("%Y-%m-%d %H:%M:%S")
+        except Exception: pass
         return time_str or ""
-    
     def _clean_source(self, source: str) -> str:
-        """清理发布来源信息"""
-        # 移除HTML标签
-        clean_source = re.sub(r'<[^>]+>', '', source)
-        return clean_source.strip()
-    
-    def get_summary_stats(self, parsed_data: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """获取数据统计摘要"""
-        if not parsed_data:
-            return {}
-        
-        total_posts = len(parsed_data)
-        retweet_count = sum(1 for post in parsed_data if post['is_retweet'])
-        original_count = total_posts - retweet_count
-        
-        total_images = sum(len(post['media']['images']) for post in parsed_data)
-        total_videos = sum(len(post['media']['videos']) for post in parsed_data)
-        
-        total_interactions = sum(
-            post['interaction']['reposts_count'] + 
-            post['interaction']['comments_count'] + 
-            post['interaction']['attitudes_count']
-            for post in parsed_data
-        )
-        
-        return {
-            'total_posts': total_posts,
-            'original_posts': original_count,
-            'retweet_posts': retweet_count,
-            'total_images': total_images,
-            'total_videos': total_videos,
-            'total_interactions': total_interactions,
-            'avg_interactions_per_post': total_interactions / total_posts if total_posts > 0 else 0
-        }
-    
-    def print_summary(self, parsed_data: List[Dict[str, Any]]):
-        """打印数据摘要"""
-        pass
-    
+        return re.sub(r'<[^>]+>', '', source).strip()
+
     def download_and_convert_image(self, image_url: str) -> Optional[Dict[str, str]]:
-        """下载图片并转换为base64格式"""
-        if not Image:
-            return None
-            
+        if not Image: return None
         try:
-            # 下载图片
             response = requests.get(image_url, timeout=10)
-            if response.status_code != 200:
-                return None
-            
+            if response.status_code != 200: return None
             image_data = response.content
-            
-            # 检查图片大小（不超过2M）
             if len(image_data) > 2 * 1024 * 1024:
-                # 压缩图片
-                image = Image.open(BytesIO(image_data))
-                # 调整图片尺寸
-                image.thumbnail((800, 600), Image.Resampling.LANCZOS)
-                
-                # 重新编码
+                img = Image.open(BytesIO(image_data))
+                img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
                 buffer = BytesIO()
-                image_format = image.format if image.format else 'JPEG'
-                image.save(buffer, format=image_format, quality=85)
+                img.save(buffer, format='JPEG', quality=85)
                 image_data = buffer.getvalue()
-            
-            # 计算MD5
-            md5_hash = hashlib.md5(image_data).hexdigest()
-            
-            # 转换为base64
-            base64_data = base64.b64encode(image_data).decode('utf-8')
-            
-            return {
-                'base64': base64_data,
-                'md5': md5_hash
-            }
-        
-        except Exception as e:
-            return None
-    
-    def send_wechat_markdown(self, markdown_content: str) -> bool:
-        """发送文本格式消息到企业微信"""
-        if not self.webhook_url:
-            return False
-        
-        try:
-            data = {
-                "msgtype": "text",
-                "text": {
-                    "content": markdown_content
-                }
-            }
-            
-            response = requests.post(self.webhook_url, json=data, timeout=10)
-            return response.status_code == 200
-        
-        except Exception as e:
-            return False
+            return {'base64': base64.b64encode(image_data).decode('utf-8'), 'md5': hashlib.md5(image_data).hexdigest()}
+        except Exception: return None
     
     def send_wechat_text(self, text: str) -> bool:
-        """发送纯文本消息到企业微信（增强版，带重试机制）"""
-        if not self.webhook_url:
-            print("   ❌ 推送失败：未配置 webhook_url")
-            return False
-        
-        # 重试机制：最多尝试3次
-        for attempt in range(3):
-            try:
-                data = {
-                    "msgtype": "text",
-                    "text": {
-                        "content": text
-                    }
-                }
-                
-                # 增加超时时间到30秒
-                response = requests.post(self.webhook_url, json=data, timeout=30)
-                
-                if response.status_code == 200:
-                    # 检查企业微信的响应内容
-                    try:
-                        result = response.json()
-                        if result.get('errcode') == 0:
-                            if attempt > 0:
-                                print(f"   ✅ 第{attempt + 1}次重试成功")
-                            return True
-                        else:
-                            error_msg = result.get('errmsg', '未知错误')
-                            print(f"   ❌ 企业微信返回错误: {error_msg}")
-                            # 如果是频率限制，等待更长时间
-                            if 'too many' in error_msg.lower() or 'limit' in error_msg.lower():
-                                print(f"   ⏰ 检测到频率限制，等待30秒...")
-                                import time
-                                time.sleep(30)
-                            return False
-                    except:
-                        if attempt > 0:
-                            print(f"   ✅ 第{attempt + 1}次重试成功")
-                        return True  # 如果无法解析响应，但状态码200就认为成功
-                else:
-                    print(f"   ❌ HTTP请求失败: 状态码 {response.status_code}")
-                    if attempt < 2:  # 不是最后一次尝试
-                        print(f"   🔄 第{attempt + 1}次尝试失败，准备重试...")
-                        import time
-                        time.sleep(5)  # 等待5秒后重试
-                        continue
-                    else:
-                        print(f"   📄 最终响应内容: {response.text[:200]}")
-                        return False
-            
-            except requests.exceptions.Timeout:
-                print(f"   ⏰ 第{attempt + 1}次尝试超时")
-                if attempt < 2:
-                    print(f"   🔄 准备重试...")
-                    import time
-                    time.sleep(3)
-                    continue
-                else:
-                    print(f"   ❌ 多次尝试后仍然超时")
-                    return False
-            
-            except requests.exceptions.ConnectionError:
-                print(f"   🌐 第{attempt + 1}次尝试网络连接失败")
-                if attempt < 2:
-                    print(f"   🔄 准备重试...")
-                    import time
-                    time.sleep(5)
-                    continue
-                else:
-                    print(f"   ❌ 多次尝试后仍然无法连接")
-                    return False
-            
-            except Exception as e:
-                print(f"   ❌ 第{attempt + 1}次尝试异常: {str(e)}")
-                if attempt < 2:
-                    print(f"   🔄 准备重试...")
-                    import time
-                    time.sleep(3)
-                    continue
-                else:
-                    print(f"   ❌ 多次尝试后仍然失败")
-                    return False
-        
-        return False
-    
-    def send_wechat_image(self, image_info: Dict[str, str]) -> bool:
-        """发送图片消息到企业微信"""
-        if not self.webhook_url:
-            return False
-        
+        if not self.webhook_url: return False
         try:
-            data = {
-                "msgtype": "image",
-                "image": {
-                    "base64": image_info['base64'],
-                    "md5": image_info['md5']
-                }
-            }
-            
+            data = {"msgtype": "text", "text": {"content": text}}
             response = requests.post(self.webhook_url, json=data, timeout=10)
-            return response.status_code == 200
+            return response.json().get('errcode') == 0
+        except Exception: return False
         
-        except Exception as e:
-            return False
-    
-    def format_post_content_markdown(self, status: Dict[str, Any]) -> str:
-        """格式化动态内容为文本格式"""
-        user_name = status['user']['screen_name']
-        content = status['text_raw']
-        created_time = status['created_at']
-        post_id = status['id']
-        
-        # 根据内容长度决定是否截断
-        max_length = 500
-        if len(content) > max_length:
-            content = content[:max_length] + "..."
-        
-        # 使用颜色和格式化
-        formatted_text = f"## <font color=\"info\">📝 微博动态</font>\n\n"
-        formatted_text += f"**<font color=\"comment\">👤 用户：</font>** {user_name}\n"
-        formatted_text += f"**<font color=\"comment\">🕐 时间：</font>** {created_time}\n"
-        formatted_text += f"**<font color=\"comment\">🆔 ID：</font>** {post_id}\n\n"
-        
-        # 添加内容
-        formatted_text += f"### <font color=\"warning\">💬 内容：</font>\n"
-        formatted_text += f"> {content}\n\n"
-        
-        # 添加媒体信息
-        if status['media']['images']:
-            image_count = len(status['media']['images'])
-            formatted_text += f"**<font color=\"info\">🖼️ 图片：</font>** {image_count}张\n"
-        
-        if status['media']['videos']:
-            video_count = len(status['media']['videos'])
-            formatted_text += f"**<font color=\"info\">🎥 视频：</font>** {video_count}个\n"
-        
-        formatted_text += "\n---\n"
-        
-        return formatted_text
-    
-    def format_post_content(self, status: Dict[str, Any]) -> str:
-        """格式化动态内容为纯文本"""
-        user_name = status['user']['screen_name']
-        content = status['text_raw']
-        created_time = status['created_at']
-        
-        # 先清理内容中的短链接
-        cleaned_content = self._clean_content_for_wechat(content)
-        
-        # 根据内容长度决定是否截断
-        max_length = 300
-        if len(cleaned_content) > max_length:
-            cleaned_content = cleaned_content[:max_length] + "..."
-        
-        formatted_text = f"📝 微博动态\n\n"
-        formatted_text += f"👤 用户：{user_name}\n"
-        formatted_text += f"🕐 时间：{created_time}\n\n"
-        formatted_text += f"💬 内容：\n{cleaned_content}"
-        
-        return formatted_text
-    
-    def send_post_notifications(self, parsed_data: List[Dict[str, Any]], max_posts: int = 20) -> int:
-        """发送动态通知到企业微信（只使用纯文本格式）"""
-        if not self.webhook_url:
-            return 0
-        
-        sent_count = 0
-        success_count = 0
-        
-        # 增加发送数量
-        posts_to_send = parsed_data[:max_posts]
-        
-        print(f"\n📨 开始发送 {len(posts_to_send)} 条动态到企业微信...")
-        
-        for index, post in enumerate(posts_to_send, 1):
-            try:
-                print(f"\n🔄 正在发送第 {index} 条动态...")
-                
-                # 直接使用纯文本格式
-                text_content = self.format_post_content(post)
-                success = False
-                
-                # 重试机制（最多3次）
-                for retry in range(3):
-                    if self.send_wechat_text(text_content):
-                        print(f"   ✅ 纯文本格式发送成功")
-                        success = True
-                        break
-                    elif retry < 2:  # 不是最后一次重试
-                        print(f"   ⚠️ 第{retry + 1}次重试...")
-                        import time
-                        time.sleep(1)
-                
-                if not success:
-                    print(f"   ❌ 文本发送失败")
-                else:
-                    success_count += 1
-                    sent_count += 1
-                
-                # 发送图片（如果有，最多发送2张）
-                if post['media']['images']:
-                    total_images = len(post['media']['images'])
-                    images_to_send = min(2, total_images)  # 最多发送2张图片
-                    print(f"   🖼️ 检测到 {total_images} 张图片，发送前 {images_to_send} 张...")
-                    
-                    for i in range(images_to_send):
-                        image = post['media']['images'][i]
-                        image_info = self.download_and_convert_image(image['url'])
-                        
-                        if image_info:
-                            if self.send_wechat_image(image_info):
-                                print(f"   ✅ 第 {i+1} 张图片发送成功")
-                            else:
-                                print(f"   ❌ 第 {i+1} 张图片发送失败")
-                        else:
-                            print(f"   ⚠️ 第 {i+1} 张图片处理失败")
-                        
-                        # 在多张图片之间添加短暂延迟
-                        if i < images_to_send - 1:
-                            import time
-                            time.sleep(0.5)
-                
-                # 快速发送，不等待
-                # 注释：移除3秒延迟以提高发送速度
-                
-            except Exception as e:
-                print(f"   ❌ 发送过程出错: {e}")
-                continue
-        
-        print(f"\n🎉 发送完成！成功: {success_count}/{len(posts_to_send)} 条")
-        return sent_count
-    
-    def print_detailed_data(self, parsed_data: List[Dict[str, Any]]):
-        """打印详细数据"""
-        # 简化输出，只显示统计信息
-        print(f"📋 详细数据展示 - 共 {len(parsed_data)} 条动态")
-        
-
-def _get_post_datetime(created_at_str: Optional[str]) -> Optional[datetime]:
-    """获取动态的发布时间（带时区信息）"""
-    if not created_at_str:
-        return None
-    
-    try:
-        # 微博时间格式: "Sun Aug 24 12:34:56 +0800 2025" 或 "Wed Jan 09 12:34:56 +0800 2025"
-        dt = datetime.strptime(created_at_str, "%a %b %d %H:%M:%S %z %Y")
-        return dt
-    except ValueError:
-        # 如果第一种格式失败，尝试其他常见格式
+    def send_wechat_image(self, image_info: Dict[str, str]) -> bool:
+        if not self.webhook_url: return False
         try:
-            # 尝试不同的时间格式
-            dt = datetime.strptime(created_at_str, "%Y-%m-%d %H:%M:%S")
-            return dt
-        except ValueError:
-            print(f"⚠️ 无法解析时间格式: {created_at_str}")
-            return None
-    except Exception as e:
-        print(f"⚠️ 时间解析错误: {e} - {created_at_str}")
-        return None
+            data = {"msgtype": "image", "image": {"base64": image_info['base64'], "md5": image_info['md5']}}
+            response = requests.post(self.webhook_url, json=data, timeout=20)
+            return response.json().get('errcode') == 0
+        except Exception: return False
 
+# ---------------------------------------------------------------------------
+# 全局函数
+# ---------------------------------------------------------------------------
 
-def _get_post_date(created_at_str: Optional[str]) -> Optional[Any]:
-    """获取动态的发布日期"""
-    if not created_at_str:
-        return None
-    
-    try:
-        # 微博时间格式: "Sun Aug 24 12:34:56 +0800 2025" 或 "Wed Jan 09 12:34:56 +0800 2025"
-        dt = datetime.strptime(created_at_str, "%a %b %d %H:%M:%S %z %Y")
-        return dt.date()
-    except ValueError:
-        # 如果第一种格式失败，尝试其他常见格式
-        try:
-            # 尝试不同的时间格式
-            dt = datetime.strptime(created_at_str, "%Y-%m-%d %H:%M:%S")
-            return dt.date()
-        except ValueError:
-            print(f"⚠️ 无法解析时间格式: {created_at_str}")
-            return None
-    except Exception as e:
-        print(f"⚠️ 时间解析错误: {e} - {created_at_str}")
-        return None
-
-
-def _is_promotion_simple(status: Dict[str, Any]) -> bool:
-    """简化的广告检测函数，用于时间过滤阶段"""
-    # 检查promotion字段
-    if 'promotion' in status:
-        return True
-    
-    # 检查content_auth_info
-    content_auth_info = status.get('content_auth_info', {})
-    if content_auth_info.get('content_auth_title') == '荐读':
-        return True
-    
-    # 检查readtimetype
-    if status.get('readtimetype') == 'adMblog':
-        return True
-    
-    # 检查用户名称（特殊广告账号）
-    user_name = status.get('user', {}).get('screen_name', '')
-    if '新浪航天' in user_name:
-        return True
-    
-    return False
-
-
-def check_cookie_status(weibo_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    智能检查Cookie状态
-    如果当前时间窗口没有数据，尝试检测上一个时间段是否有数据
-    只有在确认无法获取任何历史数据时才判定Cookie过期
-    """
-    if weibo_data.get('statuses'):
-        # 当前时间窗口有数据，Cookie正常
-        return {
-            'is_expired': False,
-            'reason': '当前时间窗口内有动态数据'
-        }
-    
-    # 尝试获取上一个时间段的数据进行验证
-    try:
-        verification_data = fetch_previous_period_data()
-        
-        if verification_data.get('statuses'):
-            # 能获取到上一时间段的数据，说明Cookie正常，只是当前时间段确实没有动态
-            return {
-                'is_expired': False,
-                'reason': f'当前时间窗口无动态，但上一时间段有 {len(verification_data["statuses"])} 条动态，Cookie状态正常'
-            }
-        else:
-            # 连上一时间段的数据都获取不到，Cookie可能过期
-            return {
-                'is_expired': True,
-                'reason': '当前和上一时间段都无法获取数据，Cookie可能已过期'
-            }
-    
-    except Exception as e:
-        # 验证失败时保守处理，不发送Cookie过期提醒
-        return {
-            'is_expired': False,
-            'reason': '验证检测失败，为避免误判暂不认定Cookie过期'
-        }
-
-
-def fetch_previous_period_data() -> Dict[str, Any]:
-    """
-    获取上一个时间段的数据用于验证Cookie状态
-    只获取少量数据进行验证，不做完整解析
-    """
-    url = "https://weibo.com/ajax/feed/groupstimeline"
-    
-    base_params = {
-        'list_id': '5159683220312291',
-        'refresh': '4',
-        'fast_refresh': '1',
-        'count': '10'  # 只获取少量数据用于验证
-    }
-    
-    headers = {
-        'accept': 'application/json, text/plain, */*',
-        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-        'client-version': 'v2.47.103',
-        'priority': 'u=1, i',
-        'referer': 'https://weibo.com/mygroups?gid=5159683220312291',
-        'sec-ch-ua': '"Not;A=Brand";v="99", "Microsoft Edge";v="139", "Chromium";v="139"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'server-version': 'v2025.08.21.1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0',
-        'x-requested-with': 'XMLHttpRequest',
-    }
-    
-    # 从环境变量获取SUB Cookie
-    sub_cookie = os.getenv('WEIBO_SUB_COOKIE')
-    if not sub_cookie:
-        return {"statuses": []}
-    
-    cookies = {
-        'SUB': sub_cookie,
-    }
-    
-    # 计算上一个时间段的时间窗口
-    from datetime import datetime, timedelta
-    import pytz
-    
+def fetch_weibo_data() -> List[Dict[str, Any]]:
     beijing_tz = pytz.timezone('Asia/Shanghai')
     now_beijing = datetime.now(beijing_tz)
-    current_hour = now_beijing.hour
+    start_time = now_beijing - timedelta(hours=6)
+    print(f"📅 设定抓取时间窗口: 过去6小时 (从 {start_time.strftime('%Y-%m-%d %H:%M:%S')} 开始)")
     
-    # 根据当前时间确定上一个时间段
-    if current_hour >= 11 and current_hour < 15:  # 当前12:00运行
-        # 检测昨天19:00-22:00时间段
-        start_time = (now_beijing - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
-        end_time = (now_beijing - timedelta(days=1)).replace(hour=22, minute=0, second=0, microsecond=0)
-        period_desc = "昨天19:00-22:00"
-    elif current_hour >= 15 and current_hour < 17:  # 当前16:00运行
-        # 检测昨天22:00到今天12:00时间段
-        start_time = (now_beijing - timedelta(days=1)).replace(hour=22, minute=0, second=0, microsecond=0)
-        end_time = now_beijing.replace(hour=12, minute=0, second=0, microsecond=0)
-        period_desc = "昨天22:00-今天12:00"
-    elif current_hour >= 17 and current_hour < 18:  # 当前18:00运行
-        # 检测今天12:00-16:00时间段
-        start_time = now_beijing.replace(hour=12, minute=0, second=0, microsecond=0)
-        end_time = now_beijing.replace(hour=16, minute=0, second=0, microsecond=0)
-        period_desc = "今天12:00-16:00"
-    elif current_hour >= 18 and current_hour < 21:  # 当前19:00运行
-        # 检测今天16:00-18:00时间段
-        start_time = now_beijing.replace(hour=16, minute=0, second=0, microsecond=0)
-        end_time = now_beijing.replace(hour=18, minute=0, second=0, microsecond=0)
-        period_desc = "今天16:00-18:00"
-    elif current_hour >= 21 or current_hour < 2:  # 当前22:00运行
-        # 检测今天18:00-19:00时间段
-        if current_hour >= 21:
-            start_time = now_beijing.replace(hour=18, minute=0, second=0, microsecond=0)
-            end_time = now_beijing.replace(hour=19, minute=0, second=0, microsecond=0)
-        else:  # 跨日运行的情况
-            start_time = (now_beijing - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
-            end_time = (now_beijing - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
-        period_desc = "今天18:00-19:00"
-    else:
-        # 默认检测前6小时
-        start_time = now_beijing - timedelta(hours=12)
-        end_time = now_beijing - timedelta(hours=6)
-        period_desc = "前6-12小时"
-    
-    print(f"   📋 验证时间段: {period_desc}")
-    
-    verification_statuses = []
-    
-    try:
-        # 只请求一页进行验证
-        response = requests.get(url, params=base_params, headers=headers, cookies=cookies, timeout=10)
-        
-        if response.status_code != 200:
-            print(f"   ❌ 验证请求失败，状态码: {response.status_code}")
-            return {"statuses": []}
-        
-        data = response.json()
-        statuses = data.get('statuses', [])
-        
-        if not statuses:
-            print(f"   📭 验证页面无动态")
-            return {"statuses": []}
-        
-        print(f"   📊 验证获取到 {len(statuses)} 条原始动态")
-        
-        # 检查时间窗口内的动态
-        for status in statuses:
-            post_datetime = _get_post_datetime(status.get('created_at'))
-            
-            if post_datetime is None:
-                continue
-            
-            # 跳过广告
-            if _is_promotion_simple(status):
-                continue
-            
-            # 转换为北京时间进行比较
-            if post_datetime.tzinfo is None:
-                post_datetime = beijing_tz.localize(post_datetime)
-            else:
-                post_datetime = post_datetime.astimezone(beijing_tz)
-            
-            if start_time <= post_datetime <= end_time:
-                verification_statuses.append(status)
-                if len(verification_statuses) >= 3:  # 找到3条就够了
-                    break
-        
-        print(f"   ✅ 验证时间段内找到 {len(verification_statuses)} 条有效动态")
-        
-    except Exception as e:
-        print(f"   ❌ 验证检测出错: {e}")
-        return {"statuses": []}
-    
-    return {"statuses": verification_statuses}
-
-
-def fetch_weibo_data() -> Dict[str, Any]:
-    """智能分页抓取指定时间窗口的微博数据"""
-    url = "https://weibo.com/ajax/feed/groupstimeline"
-    
-    base_params = {
-        'list_id': '5159683220312291',
-        'refresh': '4',
-        'fast_refresh': '1',
-        'count': '25'
-    }
-    
-    headers = {
-        'accept': 'application/json, text/plain, */*',
-        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-        'client-version': 'v2.47.103',
-        'priority': 'u=1, i',
-        'referer': 'https://weibo.com/mygroups?gid=5159683220312291',
-        'sec-ch-ua': '"Not;A=Brand";v="99", "Microsoft Edge";v="139", "Chromium";v="139"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'server-version': 'v2025.08.21.1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0',
-        'x-requested-with': 'XMLHttpRequest',
-    }
-    
-    # 从环境变量获取SUB Cookie
-    sub_cookie = os.getenv('WEIBO_SUB_COOKIE')
-    if not sub_cookie:
-        print("❌ 错误：未设置 WEIBO_SUB_COOKIE 环境变量")
-        print("🛠️ 请在 GitHub Actions Secrets 中设置 WEIBO_SUB_COOKIE")
-        return {"statuses": []}
-    
-    cookies = {
-        'SUB': sub_cookie,
-    }
-    
-    # 计算时间窗口
-    from datetime import datetime, timedelta
-    import pytz
-    
-    # 获取北京时间
-    beijing_tz = pytz.timezone('Asia/Shanghai')
-    now_beijing = datetime.now(beijing_tz)
-    current_hour = now_beijing.hour
-    
-    # 根据当前运行时间确定时间窗口
-    if current_hour >= 11 and current_hour < 15:  # 12:00运行 (11:45-14:59)
-        # 昨天22:00 到 今天12:00
-        start_time = (now_beijing - timedelta(days=1)).replace(hour=22, minute=0, second=0, microsecond=0)
-        end_time = now_beijing.replace(hour=12, minute=0, second=0, microsecond=0)
-        window_desc = "昨天22:00 → 今天12:00"
-    elif current_hour >= 15 and current_hour < 17:  # 16:00运行 (15:45-16:59)
-        # 今天12:00 到 今天16:00
-        start_time = now_beijing.replace(hour=12, minute=0, second=0, microsecond=0)
-        end_time = now_beijing.replace(hour=16, minute=0, second=0, microsecond=0)
-        window_desc = "今天12:00 → 今天16:00"
-    elif current_hour >= 17 and current_hour < 18:  # 18:00运行 (17:45-17:59)
-        # 今天16:00 到 今天18:00
-        start_time = now_beijing.replace(hour=16, minute=0, second=0, microsecond=0)
-        end_time = now_beijing.replace(hour=18, minute=0, second=0, microsecond=0)
-        window_desc = "今天16:00 → 今天18:00"
-    elif current_hour >= 18 and current_hour < 21:  # 19:00运行 (18:45-20:59)
-        # 今天18:00 到 今天19:00
-        start_time = now_beijing.replace(hour=18, minute=0, second=0, microsecond=0)
-        end_time = now_beijing.replace(hour=19, minute=0, second=0, microsecond=0)
-        window_desc = "今天18:00 → 今天19:00"
-    elif current_hour >= 21 or current_hour < 2:  # 22:00运行 (21:45-01:59)
-        # 今天19:00 到 今天22:00
-        if current_hour >= 21:
-            start_time = now_beijing.replace(hour=19, minute=0, second=0, microsecond=0)
-            end_time = now_beijing.replace(hour=22, minute=0, second=0, microsecond=0)
-        else:  # 跨日运行的情况
-            start_time = (now_beijing - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
-            end_time = (now_beijing - timedelta(days=1)).replace(hour=22, minute=0, second=0, microsecond=0)
-        window_desc = "今天19:00 → 今天22:00"
-    else:
-        # 默认情况：最近6小时
-        start_time = now_beijing - timedelta(hours=6)
-        end_time = now_beijing
-        window_desc = "最近6小时"
-    
-    print(f"📅 时间窗口: {window_desc}")
-    
-    all_window_statuses = []  # 时间窗口内的动态
-    all_raw_statuses = []  # 所有原始动态
+    all_statuses = []
     max_id = None
-    page_count = 0
     
-    try:
-        while True:
-            page_count += 1
-            
-            # 构建请求参数
-            params = base_params.copy()
-            if max_id:
-                params['max_id'] = max_id
-            
-            # 发送请求
-            response = requests.get(url, params=params, headers=headers, cookies=cookies, timeout=10)
-            
-            if response.status_code != 200:
-                print(f"❌ 请求失败: {response.status_code}")
-                break
-            
+    for page in range(PAGE_LIMIT):
+        print(f"🚀 正在抓取微博列表 (第 {page+1} 页)...")
+        url = "https://weibo.com/ajax/feed/groupstimeline"
+        params = {'list_id': GROUP_ID, 'count': '50'}
+        if max_id: params['max_id'] = max_id
+        headers = {'accept': 'application/json, text/plain, */*','x-requested-with': 'XMLHttpRequest','user-agent': 'Mozilla/5.0'}
+        cookies = {'SUB': SUB_COOKIE}
+        try:
+            response = requests.get(url, params=params, headers=headers, cookies=cookies, timeout=15)
             data = response.json()
             statuses = data.get('statuses', [])
-            
-            if not statuses:
+            if not statuses: 
+                print("ℹ️ 已加载到最后一页。")
                 break
             
-            all_raw_statuses.extend(statuses)
-            
-            # 检查每条动态的发布时间
-            found_old_post = False
-            page_window_count = 0
-            
-            for status in statuses:
-                post_datetime = _get_post_datetime(status.get('created_at'))
-                
-                if post_datetime is None:
-                    continue
-                
-                # 检查是否为广告
-                if _is_promotion_simple(status):
-                    continue
-                
-                # 转换为北京时间进行比较
-                if post_datetime.tzinfo is None:
-                    post_datetime = beijing_tz.localize(post_datetime)
-                else:
-                    post_datetime = post_datetime.astimezone(beijing_tz)
-                    
-                if start_time <= post_datetime <= end_time:
-                    all_window_statuses.append(status)
-                    page_window_count += 1
-                elif post_datetime < start_time:
-                    found_old_post = True
-                    break
-            
-            if found_old_post:
+            last_post_time = datetime.strptime(statuses[-1]['created_at'], "%a %b %d %H:%M:%S %z %Y")
+            if last_post_time < start_time:
+                relevant_posts = [s for s in statuses if datetime.strptime(s['created_at'], "%a %b %d %H:%M:%S %z %Y") >= start_time]
+                all_statuses.extend(relevant_posts)
                 break
-            
-            # 获取下一页的max_id
+            all_statuses.extend(statuses)
             max_id = data.get('max_id_str')
-            if not max_id:
-                break
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ 网络请求失败: {e}")
-    except json.JSONDecodeError as e:
-        print(f"❌ JSON解析失败: {e}")
-    except Exception as e:
-        print(f"❌ 抓取过程出错: {e}")
-
-    print(f"📊 抓取完成 - 窗口内动态: {len(all_window_statuses)} 条")
-
-    return {"statuses": all_window_statuses}
-
-
-def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[str, Any]]) -> int:
-    """发送上新预告通知到企业微信（包含文本+图片）"""
-    if not parser.webhook_url or not launch_posts:
-        return 0
-    
-    sent_count = 0
-    
-    for i, launch_info in enumerate(launch_posts, 1):
-        try:
-            print(f"\n🔄 正在发送第 {i} 条上新预告...")
-            
-            # 格式化上新预告内容
-            formatted_content = format_launch_notification(launch_info)
-            
-            # 发送文本消息
-            success = parser.send_wechat_text(formatted_content)
-            
-            if success:
-                print(f"   ✅ 上新预告文本发送成功")
-                sent_count += 1
-                
-                # 短暂延迟确保文本消息先到达
-                import time
-                time.sleep(1)
-                
-                # 发送图片（如果有，最多发送2张）
-                media_info = launch_info.get('media', {})
-                if media_info and media_info.get('images'):
-                    total_images = len(media_info['images'])
-                    images_to_send = min(2, total_images)  # 最多发送2张图片
-                    print(f"   🖼️ 检测到 {total_images} 张图片，发送前 {images_to_send} 张...")
-                    
-                    for img_idx in range(images_to_send):
-                        image = media_info['images'][img_idx]
-                        image_info = parser.download_and_convert_image(image['url'])
-                        
-                        if image_info:
-                            if parser.send_wechat_image(image_info):
-                                print(f"   ✅ 上新预告第 {img_idx+1} 张图片发送成功")
-                            else:
-                                print(f"   ❌ 上新预告第 {img_idx+1} 张图片发送失败")
-                        else:
-                            print(f"   ⚠️ 上新预告第 {img_idx+1} 张图片处理失败")
-                        
-                        # 在多张图片之间添加短暂延迟
-                        if img_idx < images_to_send - 1:
-                            time.sleep(0.5)
-                    
-                    # 在下一条消息之前添加额外延迟
-                    if i < len(launch_posts):  # 不是最后一条
-                        time.sleep(2)
-                        print(f"   🕰️ 等待 2 秒后发送下一条...")
-                else:
-                    print(f"   📝 该上新预告没有图片")
-                    
-                    # 没有图片时也需要延迟以保证顺序
-                    if i < len(launch_posts):  # 不是最后一条
-                        time.sleep(1)
-                        print(f"   🕰️ 等待 1 秒后发送下一条...")
-            else:
-                print(f"   ❌ 上新预告文本发送失败")
-                
+            if not max_id or max_id == "0": break
+            time.sleep(1)
         except Exception as e:
-            print(f"   ❌ 发送过程出错: {e}")
-            continue
-    
-    return sent_count
-
+            print(f"❌ 抓取第 {page+1} 页时出错: {e}")
+            break
+    return all_statuses
 
 def _clean_content_for_wechat(content: str) -> str:
-    """清理微信推送内容，删除短链接"""
-    import re
-    
-    # 删除各种短链接格式
-    link_patterns = [
-        r'https?://t\.cn/\w+',      # http://t.cn/xxx 或 https://t.cn/xxx
-        r't\.cn/\w+',               # t.cn/xxx
-        r'网页链接',                 # 微博中的“网页链接”文字
-        r'​+',                      # 删除多余的零宽字符
-    ]
-    
-    cleaned_content = content
-    for pattern in link_patterns:
-        cleaned_content = re.sub(pattern, '', cleaned_content)
-    
-    # 清理多余的空格和换行
-    cleaned_content = re.sub(r'\s+', ' ', cleaned_content).strip()
-    
-    return cleaned_content
-
+    cleaned = re.sub(r'https?://t\.cn/\w+|网页链接', '', content)
+    return re.sub(r'\s+', ' ', cleaned).strip()
 
 def format_launch_notification(launch_info: Dict[str, Any]) -> str:
-    """格式化上新预告消息"""
-    from datetime import datetime
-    
-    user_name = launch_info['user_name']
-    launch_type = launch_info['launch_type']
-    content = launch_info['content']
-    extracted_time = launch_info['extracted_time']
-    created_time = launch_info['created_time']  # 商家实际发帖时间
-    media_info = launch_info.get('media', {})
-    
-    # 先清理内容中的短链接
-    cleaned_content = _clean_content_for_wechat(content)
-    
-    # 根据内容长度决定是否截断
-    max_length = 400
-    if len(cleaned_content) > max_length:
-        cleaned_content = cleaned_content[:max_length] + "..."
-    
-    # 从商家发帖时间提取时分信息
-    try:
-        # 如果是已解析的格式（YYYY-MM-DD HH:MM:SS）
-        if '-' in created_time and ':' in created_time:
-            post_time = datetime.strptime(created_time, "%Y-%m-%d %H:%M:%S")
-        else:
-            # 如果是原始格式（Wed Jan 09 12:34:56 +0800 2025）
-            post_time = datetime.strptime(created_time, "%a %b %d %H:%M:%S %z %Y")
-        
-        post_time_str = post_time.strftime('%H:%M')
-    except Exception:
-        # 如果解析失败，使用当前时间作为备选
-        post_time_str = datetime.now().strftime('%H:%M')
-    
-    # 处理提取的时间信息，添加'点'提高可读性
-    formatted_extracted_time = []
-    if extracted_time:
-        for time_str in extracted_time:
-            # 如果是时间范围格式（如15-17），添加'点'
-            if '-' in time_str and time_str.replace('-', '').isdigit():
-                parts = time_str.split('-')
-                if len(parts) == 2:
-                    formatted_time = f"{parts[0]}点-{parts[1]}点"
-                    formatted_extracted_time.append(formatted_time)
+    user_name = launch_info['user']['screen_name']
+    content = _clean_content_for_wechat(launch_info['text_raw'])
+    if len(content) > 400: content = content[:400] + "..."
+    return f"🛍️【上新预告】{user_name}\n\n💬 {content}"
+
+def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[str, Any]]):
+    print(f"\n📨 开始推送 {len(launch_posts)} 条上新预告到企业微信...")
+    for post in launch_posts:
+        text_content = format_launch_notification(post)
+        if parser.send_wechat_text(text_content):
+            print(f"   ✅ 文本推送成功: {post['user']['screen_name']}")
+            time.sleep(1)
+            images = post.get('media', {}).get('images', [])
+            for i, image in enumerate(images[:2]): # 最多发2张
+                image_info = parser.download_and_convert_image(image['url'])
+                if image_info and parser.send_wechat_image(image_info):
+                    print(f"      - 图片 {i+1} 发送成功")
                 else:
-                    formatted_extracted_time.append(time_str)
-            else:
-                formatted_extracted_time.append(time_str)
-    
-    # 格式化图片数量显示
-    image_count = len(media_info.get('images', []))
-    if image_count > 0:
-        if image_count > 2:
-            image_info = f"{image_count}张图片(发送前2张)"
+                    print(f"      - 图片 {i+1} 发送失败")
+                time.sleep(0.5)
         else:
-            image_info = f"{image_count}张图片"
+            print(f"   ❌ 文本推送失败: {post['user']['screen_name']}")
+        time.sleep(2)
+
+def main(webhook_url: Optional[str] = None, enable_push: bool = True):
+    global SUB_COOKIE
+    # 【核心升级】智能加载Cookie
+    SUB_COOKIE = os.getenv('WEIBO_SUB_COOKIE')
+    if SUB_COOKIE:
+        print("✅ 成功从环境变量加载 Cookie (GitHub Actions 模式)。")
     else:
-        image_info = "无图片"
-    
-    # 采用推荐的简洁卡片式格式
-    formatted_text = f"🛍️ 【上新预告】{user_name}\n\n"
-    
-    # 关键信息一行显示，用竖线分隔
-    time_display = ', '.join(formatted_extracted_time) if formatted_extracted_time else '详见内容'
-    formatted_text += f"⏰ {time_display} | 📤 {post_time_str}\n"
-    formatted_text += f"🖼️ {image_info}\n\n"
-    formatted_text += f"💬 {cleaned_content}"
-    
-    return formatted_text
+        try:
+            with open('cookie.txt', 'r', encoding='utf-8') as f:
+                SUB_COOKIE = f.read().strip()
+            if not SUB_COOKIE:
+                raise FileNotFoundError
+            print("✅ 成功从 cookie.txt 加载 Cookie (本地运行模式)。")
+        except FileNotFoundError:
+            print("❌ 致命错误: 未能加载 Cookie！")
+            print("  - 在 GitHub Actions 中, 请设置名为 WEIBO_SUB_COOKIE 的 Secret。")
+            print("  - 在本地运行, 请在脚本同目录下创建一个 `cookie.txt` 文件并填入 SUB Cookie。")
+            return
 
-
-def main(webhook_url: Optional[str] = None, enable_push: bool = False):
-    """主函数"""
-    # 显示程序运行开始时间
-    from datetime import datetime
-    import pytz
-    import time
-    
-    # 获取北京时间
-    beijing_tz = pytz.timezone('Asia/Shanghai')
-    start_time = datetime.now(beijing_tz)
+    start_time = datetime.now(pytz.timezone('Asia/Shanghai'))
     print(f"🚀 程序运行开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
     
-    # 定义所有执行时间点
-    target_times = [
-        {'hour': 12, 'minute': 0, 'name': '中午上新检测'},
-        {'hour': 16, 'minute': 0, 'name': '下午补货检测'},
-        {'hour': 18, 'minute': 0, 'name': '晚间预告检测'},
-        {'hour': 19, 'minute': 0, 'name': '黄金时段检测'},
-        {'hour': 22, 'minute': 0, 'name': '夜间发售检测'}
-    ]
-    
-    # 找到最近的目标执行时间
-    current_hour = start_time.hour
-    current_minute = start_time.minute
-    next_target = None
-    
-    for target in target_times:
-        target_time = start_time.replace(
-            hour=target['hour'], 
-            minute=target['minute'], 
-            second=0, 
-            microsecond=0
-        )
+    raw_statuses = fetch_weibo_data()
+    if not raw_statuses:
+        print("🏁 本次未抓取到任何微博，程序结束。")
+        return
         
-        # 如果目标时间在未来的45分钟内，就是我们的目标
-        time_diff = (target_time - start_time).total_seconds()
-        if 0 < time_diff <= 2700:  # 45分钟内
-            next_target = target
-            next_target['target_time'] = target_time
-            break
+    print(f"\n📊 抓取完成，共获得 {len(raw_statuses)} 条原始微博待处理。")
     
-    if next_target:
-        target_time = next_target['target_time']
-        wait_seconds = int((target_time - start_time).total_seconds())
-        
-        if wait_seconds > 0:
-            print(f"⏰ 当前时间为 {current_hour:02d}:{current_minute:02d}，将等待到 {target_time.strftime('%H:%M')} 执行{next_target['name']}")
-            print(f"⏳ 需要等待 {wait_seconds} 秒（{wait_seconds//60} 分钟 {wait_seconds%60} 秒）")
-            print(f"📋 预计开始时间: {target_time.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
-            
-            # 等待到目标时间
-            time.sleep(wait_seconds)
-            
-            # 重新获取当前时间
-            actual_start_time = datetime.now(beijing_tz)
-            print(f"✅ 等待完成！实际开始时间: {actual_start_time.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
-        else:
-            print(f"✅ 已到达目标时间 {target_time.strftime('%H:%M')}，立即执行{next_target['name']}")
-    else:
-        print(f"✅ 当前时间为 {current_hour:02d}:{current_minute:02d}，在正常执行窗口内，立即开始执行微博检测")
+    parser = WeiboDataParser(webhook_url=webhook_url)
+    parsed_data = parser.parse_and_enrich(raw_statuses)
     
-    print(f"🚀 开始执行微博数据抓取...")
-    
-    # 创建解析器实例
-    parser = WeiboDataParser(webhook_url)
-    
-    # 直接从微博API获取真实数据
-    weibo_data = fetch_weibo_data()
-    
-    # 检查Cookie是否过期（没有获取到任何动态数据）
-    if not weibo_data.get('statuses'):
-        print(f"\n⚠️ 未获取到动态数据，可能是Cookie过期")
-        
-        # 如果启用推送，发送Cookie更新提示
-        if enable_push and webhook_url:
-            cookie_update_message = (
-                "⚠️ 微博数据抓取异常\n\n"
-                "🔍 检测到问题：无法获取动态数据\n"
-                "💡 可能原因：Cookie已过期\n\n"
-                "🛠️ 解决方案：\n"
-                "1. 登录微博网站\n"
-                "2. 获取最新的Cookie信息\n"
-                "3. 更新程序中的cookies配置\n\n"
-                "📝 需要更新的字段：SUB(仅这一个)\n"
-                "⏰ 请及时处理，以免影响数据抓取"
-            )
-            
-            success = parser.send_wechat_text(cookie_update_message)
-            if success:
-                print(f"✅ 已发送Cookie更新提示到企业微信")
-            else:
-                print(f"❌ Cookie更新提示发送失败")
-        
-        return []
-    
-    # 解析数据
-    parsed_statuses = parser.parse_weibo_response(weibo_data)
-    
-    # 识别上新/发售预告帖子
-    launch_posts = parser.filter_launch_posts(parsed_statuses)
-    
-    # 显示详细数据
-    parser.print_detailed_data(parsed_statuses)
-    
-    # 显示上新预告信息
+    print(f"🧠 已完成数据解析和全文获取，得到 {len(parsed_data)} 条有效帖子。")
+
+    print("🔍 开始使用智能评分算法进行上新帖识别...")
+    launch_posts = parser.filter_launch_posts(parsed_data)
+
     if launch_posts:
-        print(f"🛍️ 识别到 {len(launch_posts)} 条上新/发售预告")
+        print(f"✅ 识别成功！共找到 {len(launch_posts)} 条上新帖。")
+        for i, post in enumerate(launch_posts):
+            print(f"   {i+1}. {post['user']['screen_name']}: {post['text_raw'][:50]}...")
         
-        # 生成JSON格式输出
-        import json
-        print(f"📊 JSON结构化输出:")
-        print(json.dumps(launch_posts, ensure_ascii=False, indent=2))
-        
-        # 🎯 关键修改：只有识别到上新帖子时才推送到企业微信
-        if enable_push and webhook_url:
-            print(f"📨 开始推送 {len(launch_posts)} 条上新预告到企业微信...")
-            sent_count = send_launch_notifications(parser, launch_posts)
-            print(f"🎉 已发送 {sent_count} 条上新预告到企业微信")
-    else:
-        print(f"🚫 未识别到上新/发售预告")
         if enable_push:
-            print(f"💡 由于没有上新预告，跳过企业微信推送")
-
-    # 返回解析后的数据供进一步处理
-    return parsed_statuses
-
+            send_launch_notifications(parser, launch_posts)
+        else:
+            print("🚫 推送功能已禁用，跳过推送。")
+    else:
+        print("ℹ️ 本次运行未识别到任何上新帖。")
+    
+    print("\n🏁 所有任务执行完毕。")
 
 if __name__ == "__main__":
-    import sys
-    
-    # 企业微信机器人 webhook URL
     webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=5a9b8214-4fae-4bbd-a147-9ecfe5eb6d90"
     enable_push = True
     
-    # 检查命令行参数（允许覆盖默认URL）
-    if len(sys.argv) > 1:
-        if '--webhook' in sys.argv:
-            webhook_index = sys.argv.index('--webhook')
-            if webhook_index + 1 < len(sys.argv):
-                webhook_url = sys.argv[webhook_index + 1]
-                enable_push = True
-        elif '--no-push' in sys.argv:
-            enable_push = False
-    
-    # 也可以通过环境变量覆盖
-    import os
+    if '--no-push' in sys.argv:
+        enable_push = False
+    if '--webhook' in sys.argv:
+        try:
+            webhook_index = sys.argv.index('--webhook') + 1
+            webhook_url = sys.argv[webhook_index]
+        except (ValueError, IndexError):
+            print("❌ 错误: --webhook 参数后需要提供一个URL。")
+            sys.exit(1)
+            
     env_webhook = os.getenv('WECHAT_WEBHOOK_URL')
     if env_webhook:
         webhook_url = env_webhook
-        enable_push = True
     
-    try:
-        result = main(webhook_url, enable_push)
-    except Exception as e:
-        pass
+    main(webhook_url, enable_push)
