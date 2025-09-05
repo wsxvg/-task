@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V3.5 (定时等待最终版)
+微博API数据解析器 V3.5.1 (语法修正最终版)
 
 集成了所有最终功能：
+- 【语法修正】修复了 V3.5 版本中 _parse_media_content 函数定义处多余的 ']' 导致的语法错误。
 - 【定时等待执行】完整恢复，确保在 GitHub Actions 中精确对时，与智能时间窗口完美同步。
 - 【智能时间窗口】根据运行时间动态计算抓取区间，杜绝重复。
 - 【智能评分算法】使用数据驱动的评分系统精准识别。
@@ -146,7 +147,9 @@ class WeiboDataParser:
     def _parse_basic_info(self, s, r): return {'id': s.get('idstr', s.get('id')), 'text_raw': s.get('text_raw', ''), 'created_at': self._parse_time(s.get('created_at')), 'source': self._clean_source(s.get('source', '')), 'is_retweet': r}
     def _parse_user_info(self, u): return {'screen_name': u.get('screen_name', ''), 'user_id': u.get('idstr', u.get('id', ''))}
     def _parse_interaction_data(self, s): return {'reposts_count': s.get('reposts_count', 0), 'comments_count': s.get('comments_count', 0), 'attitudes_count': s.get('attitudes_count', 0)}
-    def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]]:
+    
+    # 【语法修正】移除了函数定义末尾多余的 ']'
+    def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
         media = {'images': [], 'videos': []}
         pic_infos = status.get('pic_infos', {})
         for pic_id in status.get('pic_ids', []):
@@ -157,6 +160,7 @@ class WeiboDataParser:
             page_pic_url = status['page_info'].get('page_pic', {}).get('url')
             if page_pic_url: media['images'].append({'url': page_pic_url})
         return media
+        
     def _parse_time(self, t):
         try:
             if t: return datetime.strptime(t, "%a %b %d %H:%M:%S %z %Y").strftime("%Y-%m-%d %H:%M:%S")
@@ -231,7 +235,7 @@ def fetch_weibo_data() -> List[Dict[str, Any]]:
 
 def format_launch_notification(launch_info: Dict[str, Any]) -> str:
     user_name = launch_info['user']['screen_name']
-    content = re.sub(r'https?://t\.cn/\w+', '', launch_info['text_raw']) # 只移除短链接，保留网页链接文字
+    content = re.sub(r'https?://t\.cn/\w+', '', launch_info['text_raw'])
     content = re.sub(r'\s+', ' ', content).strip()
     if len(content) > 400: content = content[:400] + "..."
     message = f"🛍️【上新预告】{user_name}\n\n💬 {content}"
@@ -270,7 +274,6 @@ def main(webhook_url: Optional[str] = None, enable_push: bool = True):
         {'hour': 22, 'minute': 0, 'name': '夜间'}
     ]
     
-    # 检查是否在预设的运行时间附近（前后15分钟），如果是，则立即执行
     in_window = False
     for target in target_times:
         if abs(start_run_time.hour - target['hour']) == 0 and abs(start_run_time.minute - target['minute']) <= 15:
@@ -279,25 +282,9 @@ def main(webhook_url: Optional[str] = None, enable_push: bool = True):
             break
 
     if not in_window:
-        print("ℹ️ 当前不在预设检测窗口内，将等待到下一个最近的时间点...")
-        # (这里简化了原版复杂的等待逻辑，直接退出。因为GitHub Actions的cron本身就是定时的)
-        # 如果您确实需要在非Actions环境长时间挂机等待，可以取消下面逻辑的注释
-        # next_run_time = None
-        # for target in sorted(target_times, key=lambda x: x['hour']):
-        #     potential_time = start_run_time.replace(hour=target['hour'], minute=target['minute'], second=0, microsecond=0)
-        #     if potential_time > start_run_time:
-        #         next_run_time = potential_time
-        #         break
-        # if not next_run_time: # If it's past the last run time of the day
-        #     next_run_time = (start_run_time + timedelta(days=1)).replace(hour=target_times[0]['hour'], minute=target_times[0]['minute'], second=0, microsecond=0)
-        
-        # wait_seconds = (next_run_time - start_run_time).total_seconds()
-        # print(f"⏳ 下一个执行时间点: {next_run_time.strftime('%H:%M:%S')}，需要等待 {int(wait_seconds)} 秒。")
-        # time.sleep(wait_seconds)
         print("🏁 非执行窗口，程序正常退出。")
         return
 
-    # --- 以下是核心执行逻辑 ---
     global SUB_COOKIE
     SUB_COOKIE = os.getenv('WEIBO_SUB_COOKIE')
     if SUB_COOKIE: print("✅ 成功从环境变量加载 Cookie (GitHub Actions 模式)。")
@@ -322,7 +309,7 @@ def main(webhook_url: Optional[str] = None, enable_push: bool = True):
     if launch_posts:
         print(f"✅ 识别成功！共找到 {len(launch_posts)} 条上新帖。")
         for i,post in enumerate(launch_posts): print(f"   {i+1}. {post['user']['screen_name']}: {post['text_raw'][:50]}...")
-        if enable_push: send_launch_notifications(parser,launch_posts)
+        if enable_push: send_launch_notifications(parser, launch_posts)
         else: print("🚫 推送功能已禁用(--no-push)。")
     else: print("ℹ️ 本次运行未识别到任何上新帖。")
     
@@ -342,4 +329,4 @@ if __name__ == "__main__":
     env_webhook = os.getenv('WECHAT_WEBHOOK_URL')
     if env_webhook: webhook_url = env_webhook
     
-    main(webhook_url, enable_push)```
+    main(webhook_url, enable_push)
