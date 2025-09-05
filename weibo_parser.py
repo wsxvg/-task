@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V3.5.1 (语法修正最终版)
+微博API数据解析器 V3.6 (定时等待最终版)
 
-集成了所有最终功能：
-- 【语法修正】修复了 V3.5 版本中 _parse_media_content 函数定义处多余的 ']' 导致的语法错误。
-- 【定时等待执行】完整恢复，确保在 GitHub Actions 中精确对时，与智能时间窗口完美同步。
-- 【智能时间窗口】根据运行时间动态计算抓取区间，杜绝重复。
-- 【智能评分算法】使用数据驱动的评分系统精准识别。
-- 【展开全文+真实链接】并行高速获取完整内容和最终商品链接。
-- 【灵活Cookie管理】自动适配 GitHub Actions (环境变量) 和本地运行 (cookie.txt)。
-- 【图片/视频封面抓取】解决防盗链问题。
+核心改进:
+- 【定时等待恢复】完整恢复了您最初脚本中智能、精确的“定时等待执行”逻辑，完美适配 GitHub Actions。
+- 【智能时间窗口】抓取函数与定时逻辑完美同步，确保数据抓取区间的准确性。
+- 集成了数据驱动的智能评分算法、并行获取全文、真实链接解析、灵活Cookie管理、图片防盗链等所有最终功能。
 """
 
 import json
@@ -147,8 +143,6 @@ class WeiboDataParser:
     def _parse_basic_info(self, s, r): return {'id': s.get('idstr', s.get('id')), 'text_raw': s.get('text_raw', ''), 'created_at': self._parse_time(s.get('created_at')), 'source': self._clean_source(s.get('source', '')), 'is_retweet': r}
     def _parse_user_info(self, u): return {'screen_name': u.get('screen_name', ''), 'user_id': u.get('idstr', u.get('id', ''))}
     def _parse_interaction_data(self, s): return {'reposts_count': s.get('reposts_count', 0), 'comments_count': s.get('comments_count', 0), 'attitudes_count': s.get('attitudes_count', 0)}
-    
-    # 【语法修正】移除了函数定义末尾多余的 ']'
     def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
         media = {'images': [], 'videos': []}
         pic_infos = status.get('pic_infos', {})
@@ -160,7 +154,6 @@ class WeiboDataParser:
             page_pic_url = status['page_info'].get('page_pic', {}).get('url')
             if page_pic_url: media['images'].append({'url': page_pic_url})
         return media
-        
     def _parse_time(self, t):
         try:
             if t: return datetime.strptime(t, "%a %b %d %H:%M:%S %z %Y").strftime("%Y-%m-%d %H:%M:%S")
@@ -262,29 +255,8 @@ def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[s
             print(f"   ❌ 文本推送失败: {post['user']['screen_name']}")
         time.sleep(2)
 
-def main(webhook_url: Optional[str] = None, enable_push: bool = True):
-    """【核心升级】恢复了您最初的定时等待执行逻辑"""
-    beijing_tz = pytz.timezone('Asia/Shanghai')
-    start_run_time = datetime.now(beijing_tz)
-    print(f"🚀 程序启动于: {start_run_time.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
-    
-    target_times = [
-        {'hour': 12, 'minute': 0, 'name': '中午'}, {'hour': 16, 'minute': 0, 'name': '下午'},
-        {'hour': 18, 'minute': 0, 'name': '傍晚'}, {'hour': 19, 'minute': 0, 'name': '黄金时段'},
-        {'hour': 22, 'minute': 0, 'name': '夜间'}
-    ]
-    
-    in_window = False
-    for target in target_times:
-        if abs(start_run_time.hour - target['hour']) == 0 and abs(start_run_time.minute - target['minute']) <= 15:
-            in_window = True
-            print(f"✅ 在 {target['name']} 检测窗口内，立即执行...")
-            break
-
-    if not in_window:
-        print("🏁 非执行窗口，程序正常退出。")
-        return
-
+def execute_monitoring(webhook_url: Optional[str] = None, enable_push: bool = True):
+    """核心执行逻辑"""
     global SUB_COOKIE
     SUB_COOKIE = os.getenv('WEIBO_SUB_COOKIE')
     if SUB_COOKIE: print("✅ 成功从环境变量加载 Cookie (GitHub Actions 模式)。")
@@ -309,7 +281,7 @@ def main(webhook_url: Optional[str] = None, enable_push: bool = True):
     if launch_posts:
         print(f"✅ 识别成功！共找到 {len(launch_posts)} 条上新帖。")
         for i,post in enumerate(launch_posts): print(f"   {i+1}. {post['user']['screen_name']}: {post['text_raw'][:50]}...")
-        if enable_push: send_launch_notifications(parser, launch_posts)
+        if enable_push: send_launch_notifications(parser,launch_posts)
         else: print("🚫 推送功能已禁用(--no-push)。")
     else: print("ℹ️ 本次运行未识别到任何上新帖。")
     
@@ -329,4 +301,47 @@ if __name__ == "__main__":
     env_webhook = os.getenv('WECHAT_WEBHOOK_URL')
     if env_webhook: webhook_url = env_webhook
     
-    main(webhook_url, enable_push)
+    # 【核心升级】恢复您最初的定时等待执行逻辑
+    beijing_tz = pytz.timezone('Asia/Shanghai')
+    start_time = datetime.now(beijing_tz)
+    print(f"🚀 程序启动于: {start_time.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
+    
+    target_times = [
+        {'hour': 12, 'minute': 0, 'name': '中午上新检测'}, {'hour': 16, 'minute': 0, 'name': '下午补货检测'},
+        {'hour': 18, 'minute': 0, 'name': '晚间预告检测'}, {'hour': 19, 'minute': 0, 'name': '黄金时段检测'},
+        {'hour': 22, 'minute': 0, 'name': '夜间发售检测'}
+    ]
+    
+    next_target = None
+    # 寻找下一个最近的目标时间点
+    for target in sorted(target_times, key=lambda x: (x['hour'], x['minute'])):
+        target_dt = start_time.replace(hour=target['hour'], minute=target['minute'], second=0, microsecond=0)
+        # 如果目标时间在未来的45分钟内，就是我们的目标
+        if 0 < (target_dt - start_time).total_seconds() <= 2700:
+            next_target = target
+            next_target['target_time'] = target_dt
+            break
+
+    # 如果在 Actions 中启动得非常准时，可能一上来就在窗口内
+    is_in_window_now = False
+    for target in target_times:
+        if start_time.hour == target['hour'] and abs(start_time.minute - target['minute']) <= 15:
+            is_in_window_now = True
+            break
+            
+    if next_target:
+        target_time = next_target['target_time']
+        wait_seconds = (target_time - start_time).total_seconds()
+        print(f"⏰ 检测到下一个执行点: {target_time.strftime('%H:%M')} ({next_target['name']})")
+        print(f"⏳ 需要等待 {int(wait_seconds)} 秒...")
+        time.sleep(wait_seconds)
+        
+        actual_start_time = datetime.now(beijing_tz)
+        print(f"✅ 等待完成！实际开始时间: {actual_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        execute_monitoring(webhook_url, enable_push)
+
+    elif is_in_window_now:
+        print(f"✅ 当前已在执行窗口内，立即开始...")
+        execute_monitoring(webhook_url, enable_push)
+    else:
+        print("🏁 当前不在任何预设的执行窗口或等待期内，程序正常退出。")
