@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V3.9 (Cookie失效主动告警最终版)
+微博API数据解析器 V6.0 (GitHub Actions 最终版)
 
-核心改进:
-- 【王者归来】完整恢复了您最初脚本中智能、精确的“Cookie失效检测与告警”功能。
-- 【流程优化】程序在抓取数据后会先进行Cookie状态诊断，失效则立即告警并退出。
-- 集成了定时等待、智能时间窗口、智能评分、展开全文、真实链接、灵活Cookie管理等所有最终功能。
+集成了所有最终功能，专为在 GitHub Actions 中稳定、智能地运行而设计。
 """
 
 import json
@@ -34,6 +31,8 @@ except ImportError:
 MAX_WORKERS = 10 
 GROUP_ID = '5159683220312291'
 PAGE_LIMIT = 20
+DEFAULT_SUB_COOKIE = "_2A25FuSErDeRhGeFJ7FoY8SfEyzuIHXVmtzzjrDV8PUJbkNAbLXf1kW1NfwLa8SVCbwqd6jJPgosBsh5OwDjzk6vD"
+PROXIES_SETTING = {"http": None, "https": None} # 强制禁用代理
 
 # ---------------------------------------------------------------------------
 # 全新的、基于您标注数据训练的智能评分检测器
@@ -47,7 +46,6 @@ class SmartLaunchDetector:
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50, '觉得': -40, '喜欢吗': -50}
         self.VETO_KEYWORDS = ['抽奖', '转发此微博']
         self.SCORE_THRESHOLD = 45
-
     def check(self, text: str) -> bool:
         if not text: return False
         for word in self.VETO_KEYWORDS:
@@ -70,7 +68,6 @@ class WeiboDataParser:
         self.sub_cookie = sub_cookie
         self.webhook_url = webhook_url
         self.launch_detector = SmartLaunchDetector()
-
     def _fetch_full_text(self, post_id: str) -> Optional[Dict[str, Any]]:
         time.sleep(random.uniform(0.3, 0.8))
         url = "https://weibo.com/ajax/statuses/longtext"
@@ -78,7 +75,7 @@ class WeiboDataParser:
         headers = {'accept': 'application/json, text/plain, */*','x-requested-with': 'XMLHttpRequest','user-agent': 'Mozilla/5.0','referer': f'https://weibo.com/mygroups?gid={GROUP_ID}'}
         cookies = {'SUB': self.sub_cookie}
         try:
-            response = requests.get(url, params=params, headers=headers, cookies=cookies, timeout=10)
+            response = requests.get(url, params=params, headers=headers, cookies=cookies, timeout=10, proxies=PROXIES_SETTING)
             if response.status_code == 200:
                 data = response.json()
                 if data.get('ok') == 1 and 'longTextContent' in data.get('data', {}):
@@ -88,14 +85,11 @@ class WeiboDataParser:
                     return {'post_id': post_id, 'full_text': clean_text.strip()}
         except Exception: pass
         return {'post_id': post_id, 'full_text': None}
-    
     def _resolve_short_link(self, short_link: str) -> Optional[str]:
         try:
-            response = requests.head(short_link, allow_redirects=True, timeout=10)
+            response = requests.head(short_link, allow_redirects=True, timeout=10, proxies=PROXIES_SETTING)
             return response.url
-        except Exception:
-            return None
-
+        except Exception: return None
     def _extract_and_resolve_links(self, text: str) -> List[str]:
         short_links = re.findall(r'https?://t\.cn/\w+', text)
         if not short_links: return []
@@ -106,7 +100,6 @@ class WeiboDataParser:
                 real_link = future.result()
                 if real_link: real_links.append(real_link)
         return real_links
-
     def parse_and_enrich(self, statuses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         long_text_posts = [post for post in statuses if post.get('isLongText')]
         full_texts = {}
@@ -117,7 +110,6 @@ class WeiboDataParser:
                 for future in as_completed(future_to_id):
                     result = future.result()
                     if result and result.get('full_text'): full_texts[result['post_id']] = result['full_text']
-        
         parsed_statuses = []
         for status in statuses:
             if status.get('readtimetype') == 'adMblog': continue
@@ -128,10 +120,8 @@ class WeiboDataParser:
                 parsed_status['real_links'] = self._extract_and_resolve_links(parsed_status['text_raw'])
                 parsed_statuses.append(parsed_status)
         return parsed_statuses
-
     def filter_launch_posts(self, parsed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [post for post in parsed_data if self.launch_detector.check(post.get('text_raw', ''))]
-
     def _parse_single_status(self, s: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             is_retweet = 'retweeted_status' in s; o_s = s['retweeted_status'] if is_retweet else s
@@ -164,7 +154,7 @@ class WeiboDataParser:
         if not Image: return None
         try:
             headers = {'Referer': 'https://weibo.com/','User-Agent': 'Mozilla/5.0'}
-            response = requests.get(image_url, headers=headers, timeout=10)
+            response = requests.get(image_url, headers=headers, timeout=10, proxies=PROXIES_SETTING)
             if response.status_code != 200: return None
             image_data = response.content
             if len(image_data) > 2 * 1024 * 1024:
@@ -175,41 +165,40 @@ class WeiboDataParser:
     def send_wechat_text(self, text: str) -> bool:
         if not self.webhook_url: return False
         try:
-            data = {"msgtype": "text", "text": {"content": text}}; response = requests.post(self.webhook_url, json=data, timeout=10)
+            data = {"msgtype": "text", "text": {"content": text}}; response = requests.post(self.webhook_url, json=data, timeout=10, proxies=PROXIES_SETTING)
             return response.json().get('errcode') == 0
         except Exception: return False
     def send_wechat_image(self, image_info: Dict[str, str]) -> bool:
         if not self.webhook_url: return False
         try:
             data = {"msgtype": "image", "image": {"base64": image_info['base64'], "md5": image_info['md5']}}
-            response = requests.post(self.webhook_url, json=data, timeout=20)
+            response = requests.post(self.webhook_url, json=data, timeout=20, proxies=PROXIES_SETTING)
             return response.json().get('errcode') == 0
         except Exception: return False
 
-# ---------------------------------------------------------------------------
-# 全局函数
-# ---------------------------------------------------------------------------
-
 def fetch_one_page_of_posts(sub_cookie: str, max_id: Optional[str] = None) -> Dict[str, Any]:
     url="https://weibo.com/ajax/feed/groupstimeline";params={'list_id':GROUP_ID,'count':'50'}
-    if max_id:params['max_id']=max_id
-    headers={'accept':'application/json, text/plain, */*','x-requested-with':'XMLHttpRequest','user-agent':'Mozilla/5.0'}
+    if max_id: params['max_id']=max_id
+    headers = {
+        'accept': 'application/json, text/plain, */*','accept-language': 'zh-CN,zh;q=0.9','client-version': 'v2.47.106',
+        'referer': f'https://weibo.com/mygroups?gid={GROUP_ID}','x-requested-with': 'XMLHttpRequest',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0',
+    }
     cookies={'SUB':sub_cookie}
     try:
-        response=requests.get(url,params=params,headers=headers,cookies=cookies,timeout=15)
+        response=requests.get(url,params=params,headers=headers,cookies=cookies,timeout=15, proxies=PROXIES_SETTING)
         return response.json()
-    except Exception: return {}
+    except Exception as e:
+        print(f"   - 网络请求异常: {e}")
+        return {}
 
 def fetch_weibo_data(sub_cookie: str, start_time: datetime, end_time: datetime) -> List[Dict[str, Any]]:
     all_window_statuses=[];max_id=None
     for page in range(PAGE_LIMIT):
-        # 仅在第一页时打印抓取信息，避免刷屏
-        if page == 0:
-            print(f"🚀 正在抓取微博列表 (第 {page+1} 页)...")
+        if page == 0: print(f"🚀 正在抓取微博列表 (第 {page+1} 页)...")
         data = fetch_one_page_of_posts(sub_cookie, max_id)
         statuses=data.get('statuses',[])
-        if page == 0 and not statuses:
-            return [] # 将空列表返回给 check_cookie_status 进行诊断
+        if page == 0 and not statuses: return []
         if not statuses:break
         found_old_post=False
         for status in statuses:
@@ -254,29 +243,19 @@ def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[s
         time.sleep(2)
 
 def check_cookie_status(sub_cookie: str, current_statuses: List[Dict[str, Any]]) -> bool:
-    """【王者归来】如果当前窗口为空，则回溯检查上一窗口以判断Cookie是否失效"""
-    if current_statuses:
-        return True
-    
+    if current_statuses: return True
     print("⚠️ 当前时间窗口未抓取到任何帖子，启动Cookie有效性二次验证...")
     beijing_tz=pytz.timezone('Asia/Shanghai'); now_beijing=datetime.now(beijing_tz); current_hour=now_beijing.hour
-    
-    # 动态计算上一个时间窗口
     if 11<=current_hour<15: end_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0); start_time=end_time-timedelta(hours=4)
     elif 15<=current_hour<17: end_time=now_beijing.replace(hour=12,minute=0,second=0); start_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0)
-    elif 17<=current_hour<18: end_time=now_beijing.replace(hour=16,minute=0,second=0); start_time=now_beijing.replace(hour=12,minute=0,second=0)
-    elif 18<=current_hour<21: end_time=now_beijing.replace(hour=18,minute=0,second=0); start_time=now_beijing.replace(hour=16,minute=0,second=0)
-    elif current_hour>=21 or current_hour<2: end_time=now_beijing.replace(hour=19,minute=0,second=0) if current_hour>=21 else (now_beijing-timedelta(days=1)).replace(hour=19,minute=0,second=0); start_time=end_time-timedelta(hours=1)
     else: end_time=now_beijing-timedelta(hours=6); start_time=now_beijing-timedelta(hours=12)
-    
     print(f"   - 正在回溯检查上一时间段...")
     previous_statuses = fetch_weibo_data(sub_cookie, start_time, end_time)
-    
     if previous_statuses:
         print("   ✅ 在上一时间段找到数据，判定Cookie有效，当前时段确实无新帖。")
         return True
     else:
-        print("   ❌ 当前及上一时间段均未找到任何数据，判定Cookie已失效！")
+        print("   ❌ 当前及上一时间段均未找到任何数据，判定Cookie或请求头已失效！")
         return False
 
 def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enable_push: bool = True):
@@ -293,14 +272,12 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
     print(f"📅 设定抓取时间窗口: {window_desc}")
     
     raw_statuses = fetch_weibo_data(sub_cookie, start_time, end_time)
-
     if not check_cookie_status(sub_cookie, raw_statuses):
         if enable_push:
             parser = WeiboDataParser(sub_cookie, webhook_url=webhook_url)
-            error_message = "⚠️ 微博监控失败\n\n原因: Cookie可能已过期\n连续两个时间段未抓取到任何数据，请及时更新Cookie！"
-            print("📨 正在发送Cookie失效通知...")
-            if parser.send_wechat_text(error_message): print("✅ Cookie失效通知发送成功。")
-            else: print("❌ Cookie失效通知发送失败。")
+            error_message = "⚠️ 微博监控失败\n\n原因: Cookie或请求头可能已失效\n连续两个时间段未抓取到任何数据，请及时更新。"; print("📨 正在发送失效通知...")
+            if parser.send_wechat_text(error_message): print("✅ 失效通知发送成功。")
+            else: print("❌ 失效通知发送失败。")
         return
     
     if not raw_statuses: print("🏁 本次未抓取到任何符合时间窗口的微博，程序结束。"); return
@@ -337,20 +314,16 @@ if __name__ == "__main__":
     if sub_cookie:
         print("✅ 成功从环境变量加载 Cookie (GitHub Actions 模式)。")
     else:
-        try:
-            with open('cookie.txt','r',encoding='utf-8')as f: sub_cookie=f.read().strip()
-            if not sub_cookie:raise FileNotFoundError
-            print("✅ 成功从 cookie.txt 加载 Cookie (本地运行模式)。")
-        except FileNotFoundError:
-            print("❌ 致命错误: 未能加载 Cookie！"); sys.exit(1)
+        sub_cookie = DEFAULT_SUB_COOKIE
+        print("⚠️ 未找到环境变量，使用代码中内置的默认备用 Cookie。")
 
     beijing_tz = pytz.timezone('Asia/Shanghai'); start_time = datetime.now(beijing_tz)
     print(f"🚀 程序启动于: {start_time.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
     
     target_times = [
-        {'hour': 12, 'minute': 0, 'name': '中午上新检测'}, {'hour': 16, 'minute': 0, 'name': '下午补货检测'},
-        {'hour': 18, 'minute': 0, 'name': '晚间预告检测'}, {'hour': 19, 'minute': 0, 'name': '黄金时段检测'},
-        {'hour': 22, 'minute': 0, 'name': '夜间发售检测'}
+        {'hour': 12, 'minute': 0, 'name': '中午'}, {'hour': 16, 'minute': 0, 'name': '下午'},
+        {'hour': 18, 'minute': 0, 'name': '傍晚'}, {'hour': 19, 'minute': 0, 'name': '黄金时段'},
+        {'hour': 22, 'minute': 0, 'name': '夜间'}
     ]
     
     next_target = None
