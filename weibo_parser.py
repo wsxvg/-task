@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V3.8 (语法修正最终版)
+微博API数据解析器 V3.9 (Cookie失效主动告警最终版)
 
 核心改进:
-- 【语法修正】修复了 V3.7 版本中因不当的 global 声明导致的 SyntaxError。
-- 【代码规范】采用函数参数传递方式管理 Cookie，替代了容易出错的全局变量赋值。
-- 保留了所有最终功能：定时等待、智能时间窗口、智能评分、展开全文、真实链接、灵活Cookie管理等。
+- 【王者归来】完整恢复了您最初脚本中智能、精确的“Cookie失效检测与告警”功能。
+- 【流程优化】程序在抓取数据后会先进行Cookie状态诊断，失效则立即告警并退出。
+- 集成了定时等待、智能时间窗口、智能评分、展开全文、真实链接、灵活Cookie管理等所有最终功能。
 """
 
 import json
@@ -31,7 +31,7 @@ except ImportError:
     Image = None
 
 # --- 全局配置 ---
-MAX_WORKERS = 10
+MAX_WORKERS = 10 
 GROUP_ID = '5159683220312291'
 PAGE_LIMIT = 20
 
@@ -203,12 +203,13 @@ def fetch_one_page_of_posts(sub_cookie: str, max_id: Optional[str] = None) -> Di
 def fetch_weibo_data(sub_cookie: str, start_time: datetime, end_time: datetime) -> List[Dict[str, Any]]:
     all_window_statuses=[];max_id=None
     for page in range(PAGE_LIMIT):
-        print(f"🚀 正在抓取微博列表 (第 {page+1} 页)...")
+        # 仅在第一页时打印抓取信息，避免刷屏
+        if page == 0:
+            print(f"🚀 正在抓取微博列表 (第 {page+1} 页)...")
         data = fetch_one_page_of_posts(sub_cookie, max_id)
         statuses=data.get('statuses',[])
         if page == 0 and not statuses:
-            print("\n⚠️ 警告：抓取第一页时未返回任何帖子数据。这通常意味着您的 Cookie 已过期或失效。")
-            return []
+            return [] # 将空列表返回给 check_cookie_status 进行诊断
         if not statuses:break
         found_old_post=False
         for status in statuses:
@@ -252,6 +253,32 @@ def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[s
             print(f"   ❌ 文本推送失败: {post['user']['screen_name']}")
         time.sleep(2)
 
+def check_cookie_status(sub_cookie: str, current_statuses: List[Dict[str, Any]]) -> bool:
+    """【王者归来】如果当前窗口为空，则回溯检查上一窗口以判断Cookie是否失效"""
+    if current_statuses:
+        return True
+    
+    print("⚠️ 当前时间窗口未抓取到任何帖子，启动Cookie有效性二次验证...")
+    beijing_tz=pytz.timezone('Asia/Shanghai'); now_beijing=datetime.now(beijing_tz); current_hour=now_beijing.hour
+    
+    # 动态计算上一个时间窗口
+    if 11<=current_hour<15: end_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0); start_time=end_time-timedelta(hours=4)
+    elif 15<=current_hour<17: end_time=now_beijing.replace(hour=12,minute=0,second=0); start_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0)
+    elif 17<=current_hour<18: end_time=now_beijing.replace(hour=16,minute=0,second=0); start_time=now_beijing.replace(hour=12,minute=0,second=0)
+    elif 18<=current_hour<21: end_time=now_beijing.replace(hour=18,minute=0,second=0); start_time=now_beijing.replace(hour=16,minute=0,second=0)
+    elif current_hour>=21 or current_hour<2: end_time=now_beijing.replace(hour=19,minute=0,second=0) if current_hour>=21 else (now_beijing-timedelta(days=1)).replace(hour=19,minute=0,second=0); start_time=end_time-timedelta(hours=1)
+    else: end_time=now_beijing-timedelta(hours=6); start_time=now_beijing-timedelta(hours=12)
+    
+    print(f"   - 正在回溯检查上一时间段...")
+    previous_statuses = fetch_weibo_data(sub_cookie, start_time, end_time)
+    
+    if previous_statuses:
+        print("   ✅ 在上一时间段找到数据，判定Cookie有效，当前时段确实无新帖。")
+        return True
+    else:
+        print("   ❌ 当前及上一时间段均未找到任何数据，判定Cookie已失效！")
+        return False
+
 def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enable_push: bool = True):
     beijing_tz=pytz.timezone('Asia/Shanghai');now_beijing=datetime.now(beijing_tz);current_hour=now_beijing.hour
     if 11<=current_hour<15:start_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0);end_time=now_beijing.replace(hour=12,minute=0,second=0);window_desc="昨天22:00 → 今天12:00"
@@ -266,6 +293,16 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
     print(f"📅 设定抓取时间窗口: {window_desc}")
     
     raw_statuses = fetch_weibo_data(sub_cookie, start_time, end_time)
+
+    if not check_cookie_status(sub_cookie, raw_statuses):
+        if enable_push:
+            parser = WeiboDataParser(sub_cookie, webhook_url=webhook_url)
+            error_message = "⚠️ 微博监控失败\n\n原因: Cookie可能已过期\n连续两个时间段未抓取到任何数据，请及时更新Cookie！"
+            print("📨 正在发送Cookie失效通知...")
+            if parser.send_wechat_text(error_message): print("✅ Cookie失效通知发送成功。")
+            else: print("❌ Cookie失效通知发送失败。")
+        return
+    
     if not raw_statuses: print("🏁 本次未抓取到任何符合时间窗口的微博，程序结束。"); return
     
     print(f"\n📊 抓取完成，共获得 {len(raw_statuses)} 条原始微博待处理。")
@@ -296,7 +333,6 @@ if __name__ == "__main__":
     env_webhook = os.getenv('WECHAT_WEBHOOK_URL')
     if env_webhook: webhook_url = env_webhook
     
-    # 【核心修正】统一在此处加载Cookie
     sub_cookie = os.getenv('WEIBO_SUB_COOKIE')
     if sub_cookie:
         print("✅ 成功从环境变量加载 Cookie (GitHub Actions 模式)。")
