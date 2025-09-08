@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V7.0 (回归初心最终版)
+微博API数据解析器 V6.0 (GitHub Actions 最终版)
 
-核心改进:
-- 【回归初心】彻底恢复了您最初脚本中经过验证、能够成功抓取数据的核心请求逻辑（Headers 和仅使用 SUB Cookie）。
-- 【保留精华】完整保留了智能评分、展开全文、真实链接、定时等待、失效告警等所有我们后续开发的有效功能。
-- 这是一个稳定、可靠、智能的最终版本，专为在 GitHub Actions 中长期运行而设计。
+集成了所有最终功能，专为在 GitHub Actions 中稳定、智能地运行而设计。
 """
 
 import json
@@ -35,7 +32,7 @@ MAX_WORKERS = 10
 GROUP_ID = '5159683220312291'
 PAGE_LIMIT = 20
 DEFAULT_SUB_COOKIE = "_2A25FuSErDeRhGeFJ7FoY8SfEyzuIHXVmtzzjrDV8PUJbkNAbLXf1kW1NfwLa8SVCbwqd6jJPgosBsh5OwDjzk6vD"
-PROXIES_SETTING = {"http": None, "https": None}
+PROXIES_SETTING = {"http": None, "https": None} # 强制禁用代理
 
 # ---------------------------------------------------------------------------
 # 全新的、基于您标注数据训练的智能评分检测器
@@ -180,17 +177,12 @@ class WeiboDataParser:
         except Exception: return False
 
 def fetch_one_page_of_posts(sub_cookie: str, max_id: Optional[str] = None) -> Dict[str, Any]:
-    """【核心修正】恢复与您原始脚本一致的、经过验证的请求逻辑"""
-    url="https://weibo.com/ajax/feed/groupstimeline"
-    params={'list_id':GROUP_ID,'count':'50'}
+    url="https://weibo.com/ajax/feed/groupstimeline";params={'list_id':GROUP_ID,'count':'50'}
     if max_id: params['max_id']=max_id
     headers = {
-        'accept': 'application/json, text/plain, */*',
-        'accept-language': 'zh-CN,zh;q=0.9',
-        'client-version': 'v2.47.103', # 恢复您原版中的版本号
-        'referer': f'https://weibo.com/mygroups?gid={GROUP_ID}',
-        'x-requested-with': 'XMLHttpRequest',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0',
+        'accept': 'application/json, text/plain, */*','accept-language': 'zh-CN,zh;q=0.9','client-version': 'v2.47.106',
+        'referer': f'https://weibo.com/mygroups?gid={GROUP_ID}','x-requested-with': 'XMLHttpRequest',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0',
     }
     cookies={'SUB':sub_cookie}
     try:
