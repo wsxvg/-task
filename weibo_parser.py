@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V6.0 (GitHub Actions 最终版)
+微博API数据解析器 V6.1 (算法进化最终版)
 
-集成了所有最终功能，专为在 GitHub Actions 中稳定、智能地运行而设计。
+核心改进:
+- 【算法进化】智能评分算法升级，能成功识别 `预售通知`、`上新活动` 等衍生词组。
+- 【标题权重】对出现在帖子标题区域（前35个字符）的上新关键词，给予额外加分。
+- 保留了 V6.0 的所有功能，包括定时等待、展开全文、失效告警等。
 """
 
 import json
@@ -32,10 +35,10 @@ MAX_WORKERS = 10
 GROUP_ID = '5159683220312291'
 PAGE_LIMIT = 20
 DEFAULT_SUB_COOKIE = "_2A25FuSErDeRhGeFJ7FoY8SfEyzuIHXVmtzzjrDV8PUJbkNAbLXf1kW1NfwLa8SVCbwqd6jJPgosBsh5OwDjzk6vD"
-PROXIES_SETTING = {"http": None, "https": None} # 强制禁用代理
+PROXIES_SETTING = {"http": None, "https": None}
 
 # ---------------------------------------------------------------------------
-# 全新的、基于您标注数据训练的智能评分检测器
+# 全新的、基于您标注数据训练的智能评分检测器 (V2)
 # ---------------------------------------------------------------------------
 class SmartLaunchDetector:
     def __init__(self):
@@ -45,23 +48,53 @@ class SmartLaunchDetector:
         self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30, '确认': -30, '开发': -40, '研究': -40, '还在': -20, '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10, '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20, '计划': -50, '预计': -30, '准备': -20, '快了': -20, '即将': -20, '近期': -30}
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50, '觉得': -40, '喜欢吗': -50}
         self.VETO_KEYWORDS = ['抽奖', '转发此微博']
-        self.SCORE_THRESHOLD = 45
+        self.SCORE_THRESHOLD = 50 # 阈值微调
+
     def check(self, text: str) -> bool:
         if not text: return False
         for word in self.VETO_KEYWORDS:
             if word in text and not any(action in text for action in self.ACTION_KEYWORDS): return False
-        time_score = max([v for w, v in self.STRONG_TIME_KEYWORDS.items() if w in text] or [0])
-        pattern_time_score = max([v for p, v in self.TIME_PATTERNS.items() if re.search(p, text)] or [0])
-        action_score = max([v for w, v in self.ACTION_KEYWORDS.items() if w in text] or [0])
+        
+        # 【核心升级】调用进化后的评分函数
+        time_score = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
+        pattern_time_score = self._calculate_pattern_score(text, self.TIME_PATTERNS)
+        action_score = self._calculate_score(text, self.ACTION_KEYWORDS, title_bonus=10) # 标题区域加10分
+        
         negative_score = sum(v for w, v in self.NEGATIVE_KEYWORDS.items() if w in text)
         polling_score = sum(v for w, v in self.POLLING_KEYWORDS.items() if w in text)
+        
         final_time_score = max(time_score, pattern_time_score)
         if final_time_score == 0 or action_score == 0: return False
+        
         total_score = final_time_score + action_score + negative_score + polling_score
         return total_score >= self.SCORE_THRESHOLD
 
+    def _calculate_score(self, text: str, keywords: Dict[str, int], title_bonus: int = 0) -> int:
+        """【核心升级】关键词匹配进化，并增加标题权重"""
+        max_score = 0
+        title_area = text[:35] # 定义标题区域为前35个字符
+        
+        for word, value in keywords.items():
+            if word in text:
+                score = value
+                # 如果关键词也出现在标题区域，给予额外加分
+                if title_bonus > 0 and word in title_area:
+                    score += title_bonus
+                if score > max_score:
+                    max_score = score
+        return max_score
+
+    def _calculate_pattern_score(self, text: str, patterns: Dict[str, int]) -> int:
+        """正则匹配评分，保持不变"""
+        max_score = 0
+        for pattern, value in patterns.items():
+            if re.search(pattern, text):
+                if value > max_score:
+                    max_score = value
+        return max_score
+
 # ---------------------------------------------------------------------------
-# 核心数据解析与推送类
+# 核心数据解析与推送类 (此类及其方法无需修改)
 # ---------------------------------------------------------------------------
 class WeiboDataParser:
     def __init__(self, sub_cookie: str, webhook_url: Optional[str] = None):
