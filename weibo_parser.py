@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V6.1 (算法进化最终版)
+微博API数据解析器 V6.2 (词库融合最终版)
 
 核心改进:
-- 【算法进化】智能评分算法升级，能成功识别 `预售通知`、`上新活动` 等衍生词组。
-- 【标题权重】对出现在帖子标题区域（前35个字符）的上新关键词，给予额外加分。
-- 保留了 V6.0 的所有功能，包括定时等待、展开全文、失效告警等。
+- 【词库融合】智能评分算法的关键词库，已完整吸收您最初脚本中经过实战检验的海量关键词，
+  极大提升了对口语化、多样化上新帖的识别能力。
+- 【分数校准】对融合后的新词库进行了分数微调，确保评分体系的平衡。
+- 保留了 V6.1 的所有高级算法逻辑和 V6.0 的所有核心功能。
 """
 
 import json
@@ -38,59 +39,58 @@ DEFAULT_SUB_COOKIE = "_2A25FuSErDeRhGeFJ7FoY8SfEyzuIHXVmtzzjrDV8PUJbkNAbLXf1kW1N
 PROXIES_SETTING = {"http": None, "https": None}
 
 # ---------------------------------------------------------------------------
-# 全新的、基于您标注数据训练的智能评分检测器 (V2)
+# 全新的、基于您标注数据训练的智能评分检测器 (V3)
 # ---------------------------------------------------------------------------
 class SmartLaunchDetector:
     def __init__(self):
-        self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10}
+        # 时间信号
+        self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10, '稍后': 15, '即刻': 20, '立即': 20}
         self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30, r'\d{1,2}月\d{1,2}日': 30, r'\d{1,2}号': 25, r'周[一二三四五六日]': 25}
-        self.ACTION_KEYWORDS = {'上架': 30, '发售': 30, '释放': 25, '补货': 25, '现货': 25, '开启购买': 35, '开售': 30, '补出': 20, '上新': 20, '预售': 25}
-        self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30, '确认': -30, '开发': -40, '研究': -40, '还在': -20, '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10, '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20, '计划': -50, '预计': -30, '准备': -20, '快了': -20, '即将': -20, '近期': -30}
+        
+        # 【核心升级】动作信号 - 完整吸收了您最初脚本中的海量关键词
+        self.ACTION_KEYWORDS = {
+            '上架': 30, '发售': 30, '释放': 25, '补货': 25, '现货': 25, '开启购买': 35, 
+            '开售': 30, '补出': 20, '上新': 20, '预售': 25, '开启': 20, '会员先购': 30,
+            '非会员释放': 25, 'VIP先购': 30, '先购': 25, '开放购买': 25, '已开售': 20,
+            '已上架': 20, '现货上架': 30, '上新通知': 25, '新款预告': 15, '新品上市': 20,
+            '新款上线': 20, '新品首发': 25, '首批': 15, '第一批': 15, '更新了': 10,
+            '带来了': 10, '带给大家': 10, '上🆕': 20, '🆕': 15
+        }
+        
+        # 负面信号
+        self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30, '确认': -30, '开发': -40, '研究': -40, '还在': -20, '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10, '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20, '计划': -50, '预计': -30, '准备': -20, '快了': -20, '即将': -20, '近期': -30, '延迟':-60, '取消':-60, '停止':-60}
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50, '觉得': -40, '喜欢吗': -50}
         self.VETO_KEYWORDS = ['抽奖', '转发此微博']
-        self.SCORE_THRESHOLD = 50 # 阈值微调
+        self.SCORE_THRESHOLD = 50
 
     def check(self, text: str) -> bool:
         if not text: return False
         for word in self.VETO_KEYWORDS:
             if word in text and not any(action in text for action in self.ACTION_KEYWORDS): return False
-        
-        # 【核心升级】调用进化后的评分函数
         time_score = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
         pattern_time_score = self._calculate_pattern_score(text, self.TIME_PATTERNS)
-        action_score = self._calculate_score(text, self.ACTION_KEYWORDS, title_bonus=10) # 标题区域加10分
-        
+        action_score = self._calculate_score(text, self.ACTION_KEYWORDS, title_bonus=10)
         negative_score = sum(v for w, v in self.NEGATIVE_KEYWORDS.items() if w in text)
         polling_score = sum(v for w, v in self.POLLING_KEYWORDS.items() if w in text)
-        
         final_time_score = max(time_score, pattern_time_score)
         if final_time_score == 0 or action_score == 0: return False
-        
         total_score = final_time_score + action_score + negative_score + polling_score
         return total_score >= self.SCORE_THRESHOLD
 
     def _calculate_score(self, text: str, keywords: Dict[str, int], title_bonus: int = 0) -> int:
-        """【核心升级】关键词匹配进化，并增加标题权重"""
-        max_score = 0
-        title_area = text[:35] # 定义标题区域为前35个字符
-        
+        max_score = 0; title_area = text[:35]
         for word, value in keywords.items():
             if word in text:
                 score = value
-                # 如果关键词也出现在标题区域，给予额外加分
-                if title_bonus > 0 and word in title_area:
-                    score += title_bonus
-                if score > max_score:
-                    max_score = score
+                if title_bonus > 0 and word in title_area: score += title_bonus
+                if score > max_score: max_score = score
         return max_score
 
     def _calculate_pattern_score(self, text: str, patterns: Dict[str, int]) -> int:
-        """正则匹配评分，保持不变"""
         max_score = 0
         for pattern, value in patterns.items():
             if re.search(pattern, text):
-                if value > max_score:
-                    max_score = value
+                if value > max_score: max_score = value
         return max_score
 
 # ---------------------------------------------------------------------------
@@ -98,13 +98,9 @@ class SmartLaunchDetector:
 # ---------------------------------------------------------------------------
 class WeiboDataParser:
     def __init__(self, sub_cookie: str, webhook_url: Optional[str] = None):
-        self.sub_cookie = sub_cookie
-        self.webhook_url = webhook_url
-        self.launch_detector = SmartLaunchDetector()
+        self.sub_cookie = sub_cookie; self.webhook_url = webhook_url; self.launch_detector = SmartLaunchDetector()
     def _fetch_full_text(self, post_id: str) -> Optional[Dict[str, Any]]:
-        time.sleep(random.uniform(0.3, 0.8))
-        url = "https://weibo.com/ajax/statuses/longtext"
-        params = {'id': post_id}
+        time.sleep(random.uniform(0.3, 0.8)); url = "https://weibo.com/ajax/statuses/longtext"; params = {'id': post_id}
         headers = {'accept': 'application/json, text/plain, */*','x-requested-with': 'XMLHttpRequest','user-agent': 'Mozilla/5.0','referer': f'https://weibo.com/mygroups?gid={GROUP_ID}'}
         cookies = {'SUB': self.sub_cookie}
         try:
@@ -112,16 +108,13 @@ class WeiboDataParser:
             if response.status_code == 200:
                 data = response.json()
                 if data.get('ok') == 1 and 'longTextContent' in data.get('data', {}):
-                    full_text = data['data']['longTextContent']
-                    clean_text = re.sub(r'<br\s*/?>', '\n', full_text)
-                    clean_text = re.sub(r'<.*?>', '', clean_text)
+                    full_text = data['data']['longTextContent']; clean_text = re.sub(r'<br\s*/?>', '\n', full_text); clean_text = re.sub(r'<.*?>', '', clean_text)
                     return {'post_id': post_id, 'full_text': clean_text.strip()}
         except Exception: pass
         return {'post_id': post_id, 'full_text': None}
     def _resolve_short_link(self, short_link: str) -> Optional[str]:
         try:
-            response = requests.head(short_link, allow_redirects=True, timeout=10, proxies=PROXIES_SETTING)
-            return response.url
+            response = requests.head(short_link, allow_redirects=True, timeout=10, proxies=PROXIES_SETTING); return response.url
         except Exception: return None
     def _extract_and_resolve_links(self, text: str) -> List[str]:
         short_links = re.findall(r'https?://t\.cn/\w+', text)
