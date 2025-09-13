@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V6.2 (词库融合最终版)
+微博API数据解析器 V6.3 (全能媒体解析最终版)
 
 核心改进:
-- 【词库融合】智能评分算法的关键词库，已完整吸收您最初脚本中经过实战检验的海量关键词，
-  极大提升了对口语化、多样化上新帖的识别能力。
-- 【分数校准】对融合后的新词库进行了分数微调，确保评分体系的平衡。
-- 保留了 V6.1 的所有高级算法逻辑和 V6.0 的所有核心功能。
+- 【媒体解析升级】重构了 _parse_media_content 函数，使其能通过多种路径搜索图片和视频封面URL，
+  极大提升了对不同类型视频帖子封面的抓取成功率。
+- 保留了 V6.2 的所有高级算法逻辑和核心功能。
 """
 
 import json
@@ -43,26 +42,13 @@ PROXIES_SETTING = {"http": None, "https": None}
 # ---------------------------------------------------------------------------
 class SmartLaunchDetector:
     def __init__(self):
-        # 时间信号
         self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10, '稍后': 15, '即刻': 20, '立即': 20}
         self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30, r'\d{1,2}月\d{1,2}日': 30, r'\d{1,2}号': 25, r'周[一二三四五六日]': 25}
-        
-        # 【核心升级】动作信号 - 完整吸收了您最初脚本中的海量关键词
-        self.ACTION_KEYWORDS = {
-            '上架': 30, '发售': 30, '释放': 25, '补货': 25, '现货': 25, '开启购买': 35, 
-            '开售': 30, '补出': 20, '上新': 20, '预售': 25, '开启': 20, '会员先购': 30,
-            '非会员释放': 25, 'VIP先购': 30, '先购': 25, '开放购买': 25, '已开售': 20,
-            '已上架': 20, '现货上架': 30, '上新通知': 25, '新款预告': 15, '新品上市': 20,
-            '新款上线': 20, '新品首发': 25, '首批': 15, '第一批': 15, '更新了': 10,
-            '带来了': 10, '带给大家': 10, '上🆕': 20, '🆕': 15
-        }
-        
-        # 负面信号
+        self.ACTION_KEYWORDS = {'上架': 30, '发售': 30, '释放': 25, '补货': 25, '现货': 25, '开启购买': 35, '开售': 30, '补出': 20, '上新': 20, '预售': 25, '开启': 20, '会员先购': 30, '非会员释放': 25, 'VIP先购': 30, '先购': 25, '开放购买': 25, '已开售': 20, '已上架': 20, '现货上架': 30, '上新通知': 25, '新款预告': 15, '新品上市': 20, '新款上线': 20, '新品首发': 25, '首批': 15, '第一批': 15, '更新了': 10, '带来了': 10, '带给大家': 10, '上🆕': 20, '🆕': 15}
         self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30, '确认': -30, '开发': -40, '研究': -40, '还在': -20, '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10, '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20, '计划': -50, '预计': -30, '准备': -20, '快了': -20, '即将': -20, '近期': -30, '延迟':-60, '取消':-60, '停止':-60}
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50, '觉得': -40, '喜欢吗': -50}
         self.VETO_KEYWORDS = ['抽奖', '转发此微博']
         self.SCORE_THRESHOLD = 50
-
     def check(self, text: str) -> bool:
         if not text: return False
         for word in self.VETO_KEYWORDS:
@@ -76,7 +62,6 @@ class SmartLaunchDetector:
         if final_time_score == 0 or action_score == 0: return False
         total_score = final_time_score + action_score + negative_score + polling_score
         return total_score >= self.SCORE_THRESHOLD
-
     def _calculate_score(self, text: str, keywords: Dict[str, int], title_bonus: int = 0) -> int:
         max_score = 0; title_area = text[:35]
         for word, value in keywords.items():
@@ -85,7 +70,6 @@ class SmartLaunchDetector:
                 if title_bonus > 0 and word in title_area: score += title_bonus
                 if score > max_score: max_score = score
         return max_score
-
     def _calculate_pattern_score(self, text: str, patterns: Dict[str, int]) -> int:
         max_score = 0
         for pattern, value in patterns.items():
@@ -94,11 +78,54 @@ class SmartLaunchDetector:
         return max_score
 
 # ---------------------------------------------------------------------------
-# 核心数据解析与推送类 (此类及其方法无需修改)
+# 核心数据解析与推送类
 # ---------------------------------------------------------------------------
 class WeiboDataParser:
     def __init__(self, sub_cookie: str, webhook_url: Optional[str] = None):
-        self.sub_cookie = sub_cookie; self.webhook_url = webhook_url; self.launch_detector = SmartLaunchDetector()
+        self.sub_cookie = sub_cookie
+        self.webhook_url = webhook_url
+        self.launch_detector = SmartLaunchDetector()
+
+    def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        """【核心升级】全能媒体解析器，通过多种路径寻找图片和视频封面"""
+        media = {'images': [], 'videos': []}
+        found_urls = set()
+
+        def add_image(url):
+            if url and url not in found_urls:
+                media['images'].append({'url': url})
+                found_urls.add(url)
+
+        # 路径1: 常规图片 (pic_infos)
+        pic_infos = status.get('pic_infos', {})
+        for pic_id in status.get('pic_ids', []):
+            if pic_id in pic_infos:
+                for size in ['large', 'original', 'bmiddle', 'thumbnail']:
+                    if size in pic_infos[pic_id] and pic_infos[pic_id][size].get('url'):
+                        add_image(pic_infos[pic_id][size]['url'])
+                        break
+        
+        # 路径2: 视频封面 (page_info)
+        if 'page_info' in status and status['page_info'].get('type') == 'video':
+            page_pic_url = status['page_info'].get('page_pic', {}).get('url')
+            if page_pic_url: add_image(page_pic_url)
+
+        # 路径3: 暴力搜索其他可能的封面字段
+        # 这是为了应对像您发现的那种，封面URL藏在未知字段里的情况
+        possible_keys = ['thumbnail_pic', 'bmiddle_pic', 'original_pic', 'pic', 'cover_image_url']
+        for key in possible_keys:
+            if key in status and isinstance(status[key], str) and (status[key].endswith('.jpg') or status[key].endswith('.png')):
+                add_image(status[key])
+        
+        # 路径4: 如果是转发，对被转发的微博重复以上所有步骤
+        if 'retweeted_status' in status:
+            retweeted_media = self._parse_media_content(status['retweeted_status'])
+            for img in retweeted_media['images']:
+                add_image(img['url'])
+
+        return media
+
+    # --- 以下方法与 V6.2 保持一致 ---
     def _fetch_full_text(self, post_id: str) -> Optional[Dict[str, Any]]:
         time.sleep(random.uniform(0.3, 0.8)); url = "https://weibo.com/ajax/statuses/longtext"; params = {'id': post_id}
         headers = {'accept': 'application/json, text/plain, */*','x-requested-with': 'XMLHttpRequest','user-agent': 'Mozilla/5.0','referer': f'https://weibo.com/mygroups?gid={GROUP_ID}'}
@@ -159,17 +186,6 @@ class WeiboDataParser:
     def _parse_basic_info(self, s, r): return {'id': s.get('idstr', s.get('id')), 'text_raw': s.get('text_raw', ''), 'created_at': self._parse_time(s.get('created_at')), 'source': self._clean_source(s.get('source', '')), 'is_retweet': r}
     def _parse_user_info(self, u): return {'screen_name': u.get('screen_name', ''), 'user_id': u.get('idstr', u.get('id', ''))}
     def _parse_interaction_data(self, s): return {'reposts_count': s.get('reposts_count', 0), 'comments_count': s.get('comments_count', 0), 'attitudes_count': s.get('attitudes_count', 0)}
-    def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
-        media = {'images': [], 'videos': []}
-        pic_infos = status.get('pic_infos', {})
-        for pic_id in status.get('pic_ids', []):
-            if pic_id in pic_infos:
-                for size in ['large', 'original', 'bmiddle']:
-                    if size in pic_infos[pic_id] and 'url' in pic_infos[pic_id][size]: media['images'].append({'url': pic_infos[pic_id][size]['url']}); break
-        if 'page_info' in status and status['page_info'].get('type') == 'video':
-            page_pic_url = status['page_info'].get('page_pic', {}).get('url')
-            if page_pic_url: media['images'].append({'url': page_pic_url})
-        return media
     def _parse_time(self, t):
         try:
             if t: return datetime.strptime(t, "%a %b %d %H:%M:%S %z %Y").strftime("%Y-%m-%d %H:%M:%S")
