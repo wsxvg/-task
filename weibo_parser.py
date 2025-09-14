@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V7.1 (抓取逻辑修正最终版)
+微博API数据解析器 V7.2 (全能媒体解析最终版)
 
 核心改进:
-- 【抓取逻辑修正】重构了 fetch_weibo_data 函数，采用“先抓后筛”策略，
-  彻底解决了因API返回少量“未来”帖子而导致提前停止翻页、遗漏有效帖子的致命BUG。
-- 【回归初心】继续使用您最初脚本中经过验证的、能够成功抓取数据的核心请求逻辑。
-- 保留了所有最终功能，是为在 GitHub Actions 中长期稳定运行设计的最终版本。
+- 【全能媒体解析】重构了 _parse_media_content 函数，使其能通过多种路径搜索图片和视频封面URL，
+  极大提升了对不同类型视频帖子封面的抓取成功率。
+- 【抓取逻辑修正】采用“先抓后筛”策略，彻底解决帖子遗漏问题。
+- 【功能完整】完整保留了 V6.5 的“动态标签”和“信息前置”功能，以及所有其他高级功能。
 """
 
 import json
@@ -18,7 +18,7 @@ import hashlib
 import os
 import pytz
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import sys
@@ -46,36 +46,48 @@ class SmartLaunchDetector:
         self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10, '稍后': 15, '即刻': 20, '立即': 20}
         self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30, r'\d{1,2}月\d{1,2}日': 30, r'\d{1,2}号': 25, r'周[一二三四五六日]': 25}
         self.ACTION_KEYWORDS = {'现货上架': 40, '开启购买': 35, '会员先购': 35, 'VIP先购': 35, '补货': 35, '上架': 30, '发售': 30, '开售': 30, '现货': 30, '释放': 25, '预售': 25, '先购': 25, '开放购买': 25, '上新通知': 25, '新品首发': 25, '补出': 20, '上新': 20, '开启': 20, '已开售': 20, '已上架': 20, '新品上市': 20, '新款上线': 20, '上🆕': 20, '秒空': 20, '新款预告': 15, '首批': 15, '第一批': 15, '🆕': 15, '更新了': 10, '带来了': 10, '带给大家': 10}
+        self.TYPE_KEYWORDS = {'新品首发': ['新品首发', '全新', '新款', '新品上市', '新款上线', '首批'],'热门补货': ['补货', '补出', '秒空'],'开启预售': ['预售', '开启预售'],'现货发售': ['现货', '上架', '发售', '释放', '开售']}
         self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30, '确认': -30, '开发': -40, '研究': -40, '还在': -20, '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10, '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20, '计划': -50, '预计': -30, '准备': -20, '快了': -20, '即将': -20, '近期': -30, '延迟':-60, '取消':-60, '停止':-60}
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50, '觉得': -40, '喜欢吗': -50}
         self.LOTTERY_KEYWORDS = {'抽奖': -40, '转发': -20, '参与条件': -30}
         self.SCORE_THRESHOLD = 45
-    def check(self, text: str) -> bool:
+
+    def check(self, text: str) -> Union[bool, Dict[str, Any]]:
         if not text: return False
-        time_score = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
-        pattern_time_score = self._calculate_pattern_score(text, self.TIME_PATTERNS)
-        action_score = self._calculate_score(text, self.ACTION_KEYWORDS, title_bonus=10)
+        time_score, best_time_word = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
+        pattern_time_score, best_pattern_time = self._calculate_pattern_score(text, self.TIME_PATTERNS)
+        action_score, best_action_word = self._calculate_score(text, self.ACTION_KEYWORDS, title_bonus=10)
         negative_score = sum(v for w, v in self.NEGATIVE_KEYWORDS.items() if w in text)
         polling_score = sum(v for w, v in self.POLLING_KEYWORDS.items() if w in text)
         lottery_score = sum(v for w, v in self.LOTTERY_KEYWORDS.items() if w in text)
         final_time_score = max(time_score, pattern_time_score)
         if action_score == 0: return False
         total_score = final_time_score + action_score + negative_score + polling_score + lottery_score
-        return total_score >= self.SCORE_THRESHOLD
-    def _calculate_score(self, text: str, keywords: Dict[str, int], title_bonus: int = 0) -> int:
-        max_score = 0; title_area = text[:35]
+        if total_score >= self.SCORE_THRESHOLD:
+            final_best_time = best_time_word if time_score >= pattern_time_score else best_pattern_time
+            launch_type = self._classify_type(text)
+            return {"is_launch": True, "type": launch_type, "time": final_best_time, "action": best_action_word}
+        return False
+    def _classify_type(self, text: str) -> str:
+        for type_name, keywords in self.TYPE_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text: return type_name
+        return "上新动态"
+    def _calculate_score(self, text: str, keywords: Dict[str, int], title_bonus: int = 0) -> (int, str):
+        max_score = 0; best_word = ""; title_area = text[:35]
         for word, value in keywords.items():
             if word in text:
                 score = value
                 if title_bonus > 0 and word in title_area: score += title_bonus
-                if score > max_score: max_score = score
-        return max_score
-    def _calculate_pattern_score(self, text: str, patterns: Dict[str, int]) -> int:
-        max_score = 0
+                if score > max_score: max_score = score; best_word = word
+        return max_score, best_word
+    def _calculate_pattern_score(self, text: str, patterns: Dict[str, int]) -> (int, str):
+        max_score = 0; best_match = ""
         for pattern, value in patterns.items():
-            if re.search(pattern, text):
-                if value > max_score: max_score = value
-        return max_score
+            match = re.search(pattern, text)
+            if match:
+                if value > max_score: max_score = value; best_match = match.group(0)
+        return max_score, best_match
 
 # ---------------------------------------------------------------------------
 # 核心数据解析与推送类
@@ -131,7 +143,13 @@ class WeiboDataParser:
                 parsed_statuses.append(parsed_status)
         return parsed_statuses
     def filter_launch_posts(self, parsed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [post for post in parsed_data if self.launch_detector.check(post.get('text_raw', ''))]
+        launch_posts = []
+        for post in parsed_data:
+            check_result = self.launch_detector.check(post.get('text_raw', ''))
+            if isinstance(check_result, dict) and check_result.get("is_launch"):
+                post['launch_details'] = check_result
+                launch_posts.append(post)
+        return launch_posts
     def _parse_single_status(self, s: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             is_retweet = 'retweeted_status' in s; o_s = s['retweeted_status'] if is_retweet else s
@@ -146,15 +164,24 @@ class WeiboDataParser:
     def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
         media = {'images': [], 'videos': []}; found_urls = set()
         def add_image(url):
-            if url and url not in found_urls: media['images'].append({'url': url}); found_urls.add(url)
+            if url and isinstance(url, str) and url.startswith('http') and url not in found_urls: media['images'].append({'url': url}); found_urls.add(url)
         pic_infos = status.get('pic_infos', {})
         for pic_id in status.get('pic_ids', []):
             if pic_id in pic_infos:
                 for size in ['large', 'original', 'bmiddle', 'thumbnail']:
                     if size in pic_infos[pic_id] and pic_infos[pic_id][size].get('url'): add_image(pic_infos[pic_id][size]['url']); break
-        if 'page_info' in status and status['page_info'].get('type') == 'video':
-            page_pic_url = status['page_info'].get('page_pic', {}).get('url')
-            if page_pic_url: add_image(page_pic_url)
+        if 'page_info' in status and isinstance(status['page_info'], dict):
+            page_info = status['page_info']
+            if page_info.get('page_pic') and isinstance(page_info['page_pic'], dict): add_image(page_info['page_pic'].get('url'))
+            elif isinstance(page_info.get('page_pic'), str): add_image(page_info['page_pic'])
+            if page_info.get('media_info', {}).get('big_pic_info', {}).get('pic_big', {}).get('url'): add_image(page_info['media_info']['big_pic_info']['pic_big']['url'])
+        if 'mix_media_info' in status and isinstance(status.get('mix_media_info'), dict):
+            for item in status['mix_media_info'].get('items', []):
+                if item.get('type') == 'pic' and isinstance(item.get('data'), dict):
+                     for size in ['large', 'original', 'bmiddle', 'thumbnail']:
+                         if size in item['data'] and item['data'][size].get('url'): add_image(item['data'][size]['url']); break
+                elif item.get('type') == 'video' and isinstance(item.get('data'), dict):
+                    if item['data'].get('page_pic'): add_image(item['data']['page_pic'])
         possible_keys = ['thumbnail_pic', 'bmiddle_pic', 'original_pic', 'pic', 'cover_image_url']
         for key in possible_keys:
             if key in status and isinstance(status[key], str) and (status[key].endswith('.jpg') or status[key].endswith('.png')): add_image(status[key])
@@ -197,11 +224,7 @@ class WeiboDataParser:
 def fetch_one_page_of_posts(sub_cookie: str, max_id: Optional[str] = None) -> Dict[str, Any]:
     url="https://weibo.com/ajax/feed/groupstimeline";params={'list_id':GROUP_ID,'count':'50'}
     if max_id: params['max_id']=max_id
-    headers = {
-        'accept': 'application/json, text/plain, */*','accept-language': 'zh-CN,zh;q=0.9','client-version': 'v2.47.106',
-        'referer': f'https://weibo.com/mygroups?gid={GROUP_ID}','x-requested-with': 'XMLHttpRequest',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0',
-    }
+    headers = {'accept': 'application/json, text/plain, */*','accept-language': 'zh-CN,zh;q=0.9','client-version': 'v2.47.106','referer': f'https://weibo.com/mygroups?gid={GROUP_ID}','x-requested-with': 'XMLHttpRequest','user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0'}
     cookies={'SUB':sub_cookie}
     try:
         response=requests.get(url,params=params,headers=headers,cookies=cookies,timeout=15, proxies=PROXIES_SETTING)
@@ -211,55 +234,48 @@ def fetch_one_page_of_posts(sub_cookie: str, max_id: Optional[str] = None) -> Di
         return {}
 
 def fetch_weibo_data(sub_cookie: str, start_time: datetime, end_time: datetime) -> List[Dict[str, Any]]:
-    """【核心修正】采用“先抓后筛”的健壮逻辑"""
-    all_fetched_statuses = []
-    max_id = None
-    
+    all_fetched_statuses = []; max_id = None
     print("🚀 正在抓取微博列表...")
     for page in range(PAGE_LIMIT):
         data = fetch_one_page_of_posts(sub_cookie, max_id)
         statuses = data.get('statuses', [])
-        
-        if page == 0 and not statuses: return [] # Cookie失效或网络问题
-        if not statuses: break # 正常翻到末尾
-            
+        if page == 0 and not statuses: return []
+        if not statuses: break
         all_fetched_statuses.extend(statuses)
-        
-        # 检查本页最后一个帖子是否已经早于我们的时间窗口起点，如果是，就可以提前停止
         try:
             last_post_time = datetime.strptime(statuses[-1]['created_at'], "%a %b %d %H:%M:%S %z %Y")
             if last_post_time < start_time:
                 print(f"ℹ️ 第 {page+1} 页帖子已早于时间窗口起点，提前停止抓取。")
                 break
-        except (ValueError, KeyError):
-            pass # 如果解析时间失败，继续下一页
-
+        except (ValueError, KeyError): pass
         max_id = data.get('max_id_str')
         if not max_id or max_id == "0": break
         time.sleep(1)
-        
-    # 【核心修正】在所有抓取完成后，进行统一的时间窗口筛选
     final_statuses = []
     for status in all_fetched_statuses:
         try:
             post_time = datetime.strptime(status['created_at'], "%a %b %d %H:%M:%S %z %Y")
             if start_time <= post_time <= end_time:
                 final_statuses.append(status)
-        except (ValueError, KeyError):
-            continue
-            
+        except (ValueError, KeyError): continue
     return final_statuses
 
 def format_launch_notification(launch_info: Dict[str, Any]) -> str:
-    user_name = launch_info['user']['screen_name']
-    content = re.sub(r'https?://t\.cn/\w+', '', launch_info['text_raw'])
-    content = re.sub(r'\s+', ' ', content).strip()
-    if len(content) > 400: content = content[:400] + "..."
-    message = f"🛍️【上新预告】{user_name}\n\n💬 {content}"
-    real_links = launch_info.get('real_links', [])
+    user_name = launch_info['user']['screen_name']; details = launch_info.get('launch_details', {})
+    launch_type = details.get('type', '上新动态'); title = f"🛍️【{launch_type} | {user_name}】"
+    key_info = []
+    if details.get('time'): key_info.append(f"🕒 时间: {details['time']}")
+    if details.get('action'): key_info.append(f"🔑 动作: {details['action']}")
+    key_info_str = "\n".join(key_info)
+    content = re.sub(r'https?://t\.cn/\w+', '', launch_info['text_raw']); content = re.sub(r'\s+', ' ', content).strip()
+    if len(content) > 300: content = content[:300] + "..."
+    real_links = launch_info.get('real_links', []); links_str = ""
     if real_links:
-        message += "\n\n🔗 直达链接:"
-        for i, link in enumerate(real_links): message += f"\n{i+1}. {link}"
+        links_str += "\n\n🔗 直达链接:"
+        for i, link in enumerate(real_links): links_str += f"\n{i+1}. {link}"
+    message = f"{title}\n\n{key_info_str}"
+    if key_info_str: message += "\n- - - - - - - - - - - - - - -"
+    message += f"\n💬 {content}{links_str}"
     return message
 
 def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[str, Any]]):
