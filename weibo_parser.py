@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V6.3 (全能媒体解析最终版)
+微博API数据解析器 V6.5 (动态标签+信息前置最终版)
 
 核心改进:
-- 【媒体解析升级】重构了 _parse_media_content 函数，使其能通过多种路径搜索图片和视频封面URL，
-  极大提升了对不同类型视频帖子封面的抓取成功率。
-- 保留了 V6.2 的所有高级算法逻辑和核心功能。
+- 【智能分类】算法能自动为上新帖打上【新品首发】、【热门补货】、【开启预售】等动态标签。
+- 【信息前置】推送内容中会自动提取并置顶最关键的“时间”和“动作”信息。
+- 【全新排版】企业微信的推送格式经过重新设计，信息密度和可读性大大提升。
+- 保留了 V6.2 的所有高级算法逻辑和 V6.0 的所有核心功能。
 """
 
 import json
@@ -17,7 +18,7 @@ import hashlib
 import os
 import pytz
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import sys
@@ -38,44 +39,96 @@ DEFAULT_SUB_COOKIE = "_2A25FuSErDeRhGeFJ7FoY8SfEyzuIHXVmtzzjrDV8PUJbkNAbLXf1kW1N
 PROXIES_SETTING = {"http": None, "https": None}
 
 # ---------------------------------------------------------------------------
-# 全新的、基于您标注数据训练的智能评分检测器 (V3)
+# 全新的、基于您标注数据训练的智能评分检测器 (V4 - 最终版)
 # ---------------------------------------------------------------------------
 class SmartLaunchDetector:
     def __init__(self):
+        # 时间信号
         self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10, '稍后': 15, '即刻': 20, '立即': 20}
         self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30, r'\d{1,2}月\d{1,2}日': 30, r'\d{1,2}号': 25, r'周[一二三四五六日]': 25}
-        self.ACTION_KEYWORDS = {'上架': 30, '发售': 30, '释放': 25, '补货': 25, '现货': 25, '开启购买': 35, '开售': 30, '补出': 20, '上新': 20, '预售': 25, '开启': 20, '会员先购': 30, '非会员释放': 25, 'VIP先购': 30, '先购': 25, '开放购买': 25, '已开售': 20, '已上架': 20, '现货上架': 30, '上新通知': 25, '新款预告': 15, '新品上市': 20, '新款上线': 20, '新品首发': 25, '首批': 15, '第一批': 15, '更新了': 10, '带来了': 10, '带给大家': 10, '上🆕': 20, '🆕': 15}
+        
+        # 动作信号
+        self.ACTION_KEYWORDS = {'现货上架': 40, '开启购买': 35, '会员先购': 35, 'VIP先购': 35, '补货': 35, '上架': 30, '发售': 30, '开售': 30, '现货': 30, '释放': 25, '预售': 25, '先购': 25, '开放购买': 25, '上新通知': 25, '新品首发': 25, '补出': 20, '上新': 20, '开启': 20, '已开售': 20, '已上架': 20, '新品上市': 20, '新款上线': 20, '上🆕': 20, '秒空': 20, '新款预告': 15, '首批': 15, '第一批': 15, '🆕': 15, '更新了': 10, '带来了': 10, '带给大家': 10}
+        
+        # 【新增】用于动态标签分类的词典
+        self.TYPE_KEYWORDS = {
+            '新品首发': ['新品首发', '全新', '新款', '新品上市', '新款上线', '首批'],
+            '热门补货': ['补货', '补出', '秒空'],
+            '开启预售': ['预售', '开启预售'],
+            '现货发售': ['现货', '上架', '发售', '释放', '开售']
+        }
+
+        # 负面信号
         self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30, '确认': -30, '开发': -40, '研究': -40, '还在': -20, '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10, '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20, '计划': -50, '预计': -30, '准备': -20, '快了': -20, '即将': -20, '近期': -30, '延迟':-60, '取消':-60, '停止':-60}
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50, '觉得': -40, '喜欢吗': -50}
-        self.VETO_KEYWORDS = ['抽奖', '转发此微博']
-        self.SCORE_THRESHOLD = 50
-    def check(self, text: str) -> bool:
+        self.LOTTERY_KEYWORDS = {'抽奖': -40, '转发': -20, '参与条件': -30}
+        
+        self.SCORE_THRESHOLD = 45
+
+    def check(self, text: str) -> Union[bool, Dict[str, Any]]:
+        """【核心升级】方法现在返回 False 或一个包含详细信息的字典"""
         if not text: return False
-        for word in self.VETO_KEYWORDS:
-            if word in text and not any(action in text for action in self.ACTION_KEYWORDS): return False
-        time_score = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
-        pattern_time_score = self._calculate_pattern_score(text, self.TIME_PATTERNS)
-        action_score = self._calculate_score(text, self.ACTION_KEYWORDS, title_bonus=10)
+        
+        # 评分
+        time_score, best_time_word = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
+        pattern_time_score, best_pattern_time = self._calculate_pattern_score(text, self.TIME_PATTERNS)
+        action_score, best_action_word = self._calculate_score(text, self.ACTION_KEYWORDS, title_bonus=10)
+        
         negative_score = sum(v for w, v in self.NEGATIVE_KEYWORDS.items() if w in text)
         polling_score = sum(v for w, v in self.POLLING_KEYWORDS.items() if w in text)
+        lottery_score = sum(v for w, v in self.LOTTERY_KEYWORDS.items() if w in text)
+        
         final_time_score = max(time_score, pattern_time_score)
-        if final_time_score == 0 or action_score == 0: return False
-        total_score = final_time_score + action_score + negative_score + polling_score
-        return total_score >= self.SCORE_THRESHOLD
-    def _calculate_score(self, text: str, keywords: Dict[str, int], title_bonus: int = 0) -> int:
-        max_score = 0; title_area = text[:35]
+        
+        # 核心规则：必须有动作信号
+        if action_score == 0: return False
+        
+        total_score = final_time_score + action_score + negative_score + polling_score + lottery_score
+        
+        if total_score >= self.SCORE_THRESHOLD:
+            # 【核心升级】如果通过，则提取信息并返回字典
+            final_best_time = best_time_word if time_score >= pattern_time_score else best_pattern_time
+            launch_type = self._classify_type(text, best_action_word)
+            
+            return {
+                "is_launch": True,
+                "type": launch_type,
+                "time": final_best_time,
+                "action": best_action_word
+            }
+        
+        return False
+
+    def _classify_type(self, text: str, best_action_word: str) -> str:
+        """【新增】根据关键词为上新帖分类"""
+        for type_name, keywords in self.TYPE_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text:
+                    return type_name
+        # 如果没有匹配到特定类型，则使用一个通用标签
+        return "上新"
+
+    def _calculate_score(self, text: str, keywords: Dict[str, int], title_bonus: int = 0) -> (int, str):
+        max_score = 0; best_word = ""
+        title_area = text[:35]
         for word, value in keywords.items():
             if word in text:
                 score = value
                 if title_bonus > 0 and word in title_area: score += title_bonus
-                if score > max_score: max_score = score
-        return max_score
-    def _calculate_pattern_score(self, text: str, patterns: Dict[str, int]) -> int:
-        max_score = 0
+                if score > max_score:
+                    max_score = score
+                    best_word = word
+        return max_score, best_word
+
+    def _calculate_pattern_score(self, text: str, patterns: Dict[str, int]) -> (int, str):
+        max_score = 0; best_match = ""
         for pattern, value in patterns.items():
-            if re.search(pattern, text):
-                if value > max_score: max_score = value
-        return max_score
+            match = re.search(pattern, text)
+            if match:
+                if value > max_score:
+                    max_score = value
+                    best_match = match.group(0)
+        return max_score, best_match
 
 # ---------------------------------------------------------------------------
 # 核心数据解析与推送类
@@ -85,46 +138,16 @@ class WeiboDataParser:
         self.sub_cookie = sub_cookie
         self.webhook_url = webhook_url
         self.launch_detector = SmartLaunchDetector()
-
-    def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
-        """【核心升级】全能媒体解析器，通过多种路径寻找图片和视频封面"""
-        media = {'images': [], 'videos': []}
-        found_urls = set()
-
-        def add_image(url):
-            if url and url not in found_urls:
-                media['images'].append({'url': url})
-                found_urls.add(url)
-
-        # 路径1: 常规图片 (pic_infos)
-        pic_infos = status.get('pic_infos', {})
-        for pic_id in status.get('pic_ids', []):
-            if pic_id in pic_infos:
-                for size in ['large', 'original', 'bmiddle', 'thumbnail']:
-                    if size in pic_infos[pic_id] and pic_infos[pic_id][size].get('url'):
-                        add_image(pic_infos[pic_id][size]['url'])
-                        break
-        
-        # 路径2: 视频封面 (page_info)
-        if 'page_info' in status and status['page_info'].get('type') == 'video':
-            page_pic_url = status['page_info'].get('page_pic', {}).get('url')
-            if page_pic_url: add_image(page_pic_url)
-
-        # 路径3: 暴力搜索其他可能的封面字段
-        # 这是为了应对像您发现的那种，封面URL藏在未知字段里的情况
-        possible_keys = ['thumbnail_pic', 'bmiddle_pic', 'original_pic', 'pic', 'cover_image_url']
-        for key in possible_keys:
-            if key in status and isinstance(status[key], str) and (status[key].endswith('.jpg') or status[key].endswith('.png')):
-                add_image(status[key])
-        
-        # 路径4: 如果是转发，对被转发的微博重复以上所有步骤
-        if 'retweeted_status' in status:
-            retweeted_media = self._parse_media_content(status['retweeted_status'])
-            for img in retweeted_media['images']:
-                add_image(img['url'])
-
-        return media
-
+    def filter_launch_posts(self, parsed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """【核心升级】现在会处理 check 方法返回的字典"""
+        launch_posts = []
+        for post in parsed_data:
+            check_result = self.launch_detector.check(post.get('text_raw', ''))
+            if isinstance(check_result, dict) and check_result.get("is_launch"):
+                # 将提取出的详细信息附加到 post 字典中
+                post['launch_details'] = check_result
+                launch_posts.append(post)
+        return launch_posts
     # --- 以下方法与 V6.2 保持一致 ---
     def _fetch_full_text(self, post_id: str) -> Optional[Dict[str, Any]]:
         time.sleep(random.uniform(0.3, 0.8)); url = "https://weibo.com/ajax/statuses/longtext"; params = {'id': post_id}
@@ -173,8 +196,6 @@ class WeiboDataParser:
                 parsed_status['real_links'] = self._extract_and_resolve_links(parsed_status['text_raw'])
                 parsed_statuses.append(parsed_status)
         return parsed_statuses
-    def filter_launch_posts(self, parsed_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [post for post in parsed_data if self.launch_detector.check(post.get('text_raw', ''))]
     def _parse_single_status(self, s: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             is_retweet = 'retweeted_status' in s; o_s = s['retweeted_status'] if is_retweet else s
@@ -186,6 +207,17 @@ class WeiboDataParser:
     def _parse_basic_info(self, s, r): return {'id': s.get('idstr', s.get('id')), 'text_raw': s.get('text_raw', ''), 'created_at': self._parse_time(s.get('created_at')), 'source': self._clean_source(s.get('source', '')), 'is_retweet': r}
     def _parse_user_info(self, u): return {'screen_name': u.get('screen_name', ''), 'user_id': u.get('idstr', u.get('id', ''))}
     def _parse_interaction_data(self, s): return {'reposts_count': s.get('reposts_count', 0), 'comments_count': s.get('comments_count', 0), 'attitudes_count': s.get('attitudes_count', 0)}
+    def _parse_media_content(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        media = {'images': [], 'videos': []}
+        pic_infos = status.get('pic_infos', {})
+        for pic_id in status.get('pic_ids', []):
+            if pic_id in pic_infos:
+                for size in ['large', 'original', 'bmiddle']:
+                    if size in pic_infos[pic_id] and 'url' in pic_infos[pic_id][size]: media['images'].append({'url': pic_infos[pic_id][size]['url']}); break
+        if 'page_info' in status and status['page_info'].get('type') == 'video':
+            page_pic_url = status['page_info'].get('page_pic', {}).get('url')
+            if page_pic_url: media['images'].append({'url': page_pic_url})
+        return media
     def _parse_time(self, t):
         try:
             if t: return datetime.strptime(t, "%a %b %d %H:%M:%S %z %Y").strftime("%Y-%m-%d %H:%M:%S")
@@ -256,15 +288,41 @@ def fetch_weibo_data(sub_cookie: str, start_time: datetime, end_time: datetime) 
     return all_window_statuses
 
 def format_launch_notification(launch_info: Dict[str, Any]) -> str:
+    """【核心升级】采用全新的“动态标签+信息前置”格式"""
     user_name = launch_info['user']['screen_name']
+    details = launch_info.get('launch_details', {})
+    
+    # 1. 构建动态标签标题
+    launch_type = details.get('type', '上新')
+    title = f"🛍️【{launch_type} | {user_name}】"
+    
+    # 2. 构建信息前置部分
+    key_info = []
+    if details.get('time'):
+        key_info.append(f"🕒 时间: {details['time']}")
+    if details.get('action'):
+        key_info.append(f"🔑 动作: {details['action']}")
+    
+    key_info_str = "\n".join(key_info)
+    
+    # 3. 构建内容摘要
     content = re.sub(r'https?://t\.cn/\w+', '', launch_info['text_raw'])
     content = re.sub(r'\s+', ' ', content).strip()
-    if len(content) > 400: content = content[:400] + "..."
-    message = f"🛍️【上新预告】{user_name}\n\n💬 {content}"
+    if len(content) > 300: content = content[:300] + "..."
+    
+    # 4. 构建真实链接
     real_links = launch_info.get('real_links', [])
+    links_str = ""
     if real_links:
-        message += "\n\n🔗 直达链接:"
-        for i, link in enumerate(real_links): message += f"\n{i+1}. {link}"
+        links_str += "\n\n🔗 直达链接:"
+        for i, link in enumerate(real_links): links_str += f"\n{i+1}. {link}"
+
+    # 5. 组合最终消息
+    message = f"{title}\n\n{key_info_str}"
+    if key_info_str: # 如果有关键信息，加个分隔符
+        message += "\n- - - - - - - - - - - - - - -"
+    message += f"\n💬 {content}{links_str}"
+    
     return message
 
 def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[str, Any]]):
