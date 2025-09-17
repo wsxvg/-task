@@ -1,13 +1,13 @@
-#!/usr/bin/env python3
+#!/usr/-bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V7.2 (全能媒体解析最终版)
+微博API数据解析器 V8.0 (专家大脑最终版)
 
 核心改进:
-- 【全能媒体解析】重构了 _parse_media_content 函数，使其能通过多种路径搜索图片和视频封面URL，
-  极大提升了对不同类型视频帖子封面的抓取成功率。
-- 【抓取逻辑修正】采用“先抓后筛”策略，彻底解决帖子遗漏问题。
-- 【功能完整】完整保留了 V6.5 的“动态标签”和“信息前置”功能，以及所有其他高级功能。
+- 【专家算法】引入“黄金信号豁免机制”、“组合模式识别”等高级逻辑，极大提升了对复杂和无时间戳帖子的识别能力。
+- 【究极词库】对所有关键词库进行了最后一次大规模扩充和分数校准。
+- 【健壮解析】升级了时间正则表达式，兼容更多日期格式。
+- 这是集所有功能和修正于一身的、为在 GitHub Actions 中长期稳定运行而设计的最终版本。
 """
 
 import json
@@ -39,34 +39,71 @@ DEFAULT_SUB_COOKIE = "_2A25FuSErDeRhGeFJ7FoY8SfEyzuIHXVmtzzjrDV8PUJbkNAbLXf1kW1N
 PROXIES_SETTING = {"http": None, "https": None}
 
 # ---------------------------------------------------------------------------
-# 全新的、基于您标注数据训练的智能评分检测器 (V4)
+# 全新的、基于您标注数据训练的智能评分检测器 (V5 - 专家版)
 # ---------------------------------------------------------------------------
 class SmartLaunchDetector:
     def __init__(self):
-        self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10, '稍后': 15, '即刻': 20, '立即': 20}
-        self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30, r'\d{1,2}月\d{1,2}日': 30, r'\d{1,2}号': 25, r'周[一二三四五六日]': 25}
-        self.ACTION_KEYWORDS = {'现货上架': 40, '开启购买': 35, '会员先购': 35, 'VIP先购': 35, '补货': 35, '上架': 30, '发售': 30, '开售': 30, '现货': 30, '释放': 25, '预售': 25, '先购': 25, '开放购买': 25, '上新通知': 25, '新品首发': 25, '补出': 20, '上新': 20, '开启': 20, '已开售': 20, '已上架': 20, '新品上市': 20, '新款上线': 20, '上🆕': 20, '秒空': 20, '新款预告': 15, '首批': 15, '第一批': 15, '🆕': 15, '更新了': 10, '带来了': 10, '带给大家': 10}
-        self.TYPE_KEYWORDS = {'新品首发': ['新品首发', '全新', '新款', '新品上市', '新款上线', '首批'],'热门补货': ['补货', '补出', '秒空'],'开启预售': ['预售', '开启预售'],'现货发售': ['现货', '上架', '发售', '释放', '开售']}
+        self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10, '稍后': 15, '即刻': 20, '立即': 20, '刚刚': 15, '现在': 15}
+        self.TIME_PATTERNS = {
+            r'\d{1,2}[:：]\d{2}': 35,
+            r'[0-9一二三四五六七八九十]+点': 30,
+            r'(\d{4}[-/年])?\d{1,2}[-/月]\d{1,2}日?': 30, # 匹配 YYYY-MM-DD, MM-DD, YYYY/MM/DD 等
+            r'\d{1,2}\.\d{1,2}': 30, # 匹配 9.10 这种格式
+            r'\d{1,2}号': 25,
+            r'周[一二三四五六日天]': 25
+        }
+        self.ACTION_KEYWORDS = {
+            '现货上架': 40, '开启购买': 35, '会员先购': 35, 'VIP先购': 35, '补货': 35, '提前购': 35, '开拍': 30,
+            '上架': 30, '发售': 30, '开售': 30, '现货': 30, '清仓': 30,
+            '释放': 25, '预售': 25, '先购': 25, '开放购买': 25, '上新通知': 25, '新品首发': 25,
+            '补出': 20, '上新': 20, '开启': 20, '已开售': 20, '已上架': 20, '新品上市': 20,
+            '新款上线': 20, '上🆕': 20, '秒空': 20,
+            '新款预告': 15, '首批': 15, '第一批': 15, '🆕': 15,
+            '更新了': 10, '带来了': 10, '带给大家': 10
+        }
+        self.GOLDEN_ACTION_KEYWORDS = ['上新通知', '现货上架', '开启购买', '会员先购', 'VIP先购', '提前购', '补货', '发售', '开售']
+        self.COMBO_RULES = {
+            ('已上架', '网页链接'): 50,
+            ('已上架', 'http'): 50,
+        }
+        self.TYPE_KEYWORDS = {'新品首发': ['新品首发', '全新', '新款', '新品上市', '新款上线', '首批'],'热门补货': ['补货', '补出', '秒空', '返场'],'开启预售': ['预售', '开启预售', '意向金', '尺码登记'],'清仓活动': ['清仓'],'现货发售': ['现货', '上架', '发售', '释放', '开售']}
         self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30, '确认': -30, '开发': -40, '研究': -40, '还在': -20, '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10, '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20, '计划': -50, '预计': -30, '准备': -20, '快了': -20, '即将': -20, '近期': -30, '延迟':-60, '取消':-60, '停止':-60}
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50, '觉得': -40, '喜欢吗': -50}
-        self.LOTTERY_KEYWORDS = {'抽奖': -40, '转发': -20, '参与条件': -30}
+        self.LOTTERY_KEYWORDS = {'抽奖': -40, '转发': -20, '参与条件': -30, '抽取':-40}
         self.SCORE_THRESHOLD = 45
 
     def check(self, text: str) -> Union[bool, Dict[str, Any]]:
         if not text: return False
+        
+        # 提取关键信息
         time_score, best_time_word = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
         pattern_time_score, best_pattern_time = self._calculate_pattern_score(text, self.TIME_PATTERNS)
         action_score, best_action_word = self._calculate_score(text, self.ACTION_KEYWORDS, title_bonus=10)
+        final_time_score = max(time_score, pattern_time_score)
+        final_best_time = best_time_word if time_score >= pattern_time_score else best_pattern_time
+
+        # 检查“黄金信号”豁免机制
+        has_golden_action = any(word in text for word in self.GOLDEN_ACTION_KEYWORDS)
+        if has_golden_action and final_time_score > 0:
+            print("   -> 触发“黄金信号”豁免机制，直接判定为上新帖！")
+            return {"is_launch": True, "type": self._classify_type(text), "time": final_best_time, "action": best_action_word}
+
+        # 检查“组合规则”
+        for (word1, word2), score in self.COMBO_RULES.items():
+            if word1 in text and word2 in text:
+                print("   -> 触发“组合规则”，判定为上新帖！")
+                return {"is_launch": True, "type": self._classify_type(text), "time": "即时", "action": word1}
+        
+        # 如果未触发豁免，则进入常规评分流程
+        if action_score == 0: return False
         negative_score = sum(v for w, v in self.NEGATIVE_KEYWORDS.items() if w in text)
         polling_score = sum(v for w, v in self.POLLING_KEYWORDS.items() if w in text)
         lottery_score = sum(v for w, v in self.LOTTERY_KEYWORDS.items() if w in text)
-        final_time_score = max(time_score, pattern_time_score)
-        if action_score == 0: return False
         total_score = final_time_score + action_score + negative_score + polling_score + lottery_score
+        
         if total_score >= self.SCORE_THRESHOLD:
-            final_best_time = best_time_word if time_score >= pattern_time_score else best_pattern_time
-            launch_type = self._classify_type(text)
-            return {"is_launch": True, "type": launch_type, "time": final_best_time, "action": best_action_word}
+            return {"is_launch": True, "type": self._classify_type(text), "time": final_best_time, "action": best_action_word}
+        
         return False
     def _classify_type(self, text: str) -> str:
         for type_name, keywords in self.TYPE_KEYWORDS.items():
@@ -89,9 +126,6 @@ class SmartLaunchDetector:
                 if value > max_score: max_score = value; best_match = match.group(0)
         return max_score, best_match
 
-# ---------------------------------------------------------------------------
-# 核心数据解析与推送类
-# ---------------------------------------------------------------------------
 class WeiboDataParser:
     def __init__(self, sub_cookie: str, webhook_url: Optional[str] = None):
         self.sub_cookie = sub_cookie; self.webhook_url = webhook_url; self.launch_detector = SmartLaunchDetector()
