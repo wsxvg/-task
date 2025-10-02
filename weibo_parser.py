@@ -5,6 +5,7 @@
 
 核心改进:
 - 【专家算法】引入“黄金信号豁免机制”、“组合模式识别”等高级逻辑，极大提升了对复杂和无时间戳帖子的识别能力。
+- 【终极信号】新增“终极信号”机制，优先捕捉“现货上架”等即时上新帖，避免被抽奖负分误伤。（本次升级）
 - 【究极词库】对所有关键词库进行了最后一次大规模扩充和分数校准。
 - 【健壮解析】升级了时间正则表达式，兼容更多日期格式。
 - 这是集所有功能和修正于一身的、为在 GitHub Actions 中长期稳定运行而设计的最终版本。
@@ -43,10 +44,14 @@ PROXIES_SETTING = {"http": None, "https": None}
 # ---------------------------------------------------------------------------
 class SmartLaunchDetector:
     def __init__(self):
+        # 【新增】定义一个终极上新关键词列表，这些词有最高优先级
+        self.ULTIMATE_LAUNCH_KEYWORDS = {'现货上架', '已上架', '已开售', '开启购买'}
+
+        # --- 原有代码保持不变 ---
         self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35, '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25, '本周': 20, '本周末': 25, '月底': 20, '准时': 10, '稍后': 15, '即刻': 20, '立即': 20, '刚刚': 15, '现在': 15}
         self.TIME_PATTERNS = {
             r'\d{1,2}[:：]\d{2}': 35,
-            r'[0-9一二三四五六七八九十]+点': 30,
+            r'[0-9一二三四五六七八九十]+点': 30, 
             r'(\d{4}[-/年])?\d{1,2}[-/月]\d{1,2}日?': 30, # 匹配 YYYY-MM-DD, MM-DD, YYYY/MM/DD 等
             r'\d{1,2}\.\d{1,2}': 30, # 匹配 9.10 这种格式
             r'\d{1,2}号': 25,
@@ -74,7 +79,14 @@ class SmartLaunchDetector:
 
     def check(self, text: str) -> Union[bool, Dict[str, Any]]:
         if not text: return False
-        
+
+        # 【新增】终极信号检查，拥有最高判定权
+        for word in self.ULTIMATE_LAUNCH_KEYWORDS:
+            if word in text:
+                print(f"  -> 触发“终极信号”({word})，直接判定为上新帖！")
+                return {"is_launch": True, "type": self._classify_type(text), "time": "即时", "action": word}
+
+        # --- 原有代码保持不变 ---
         # 提取关键信息
         time_score, best_time_word = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
         pattern_time_score, best_pattern_time = self._calculate_pattern_score(text, self.TIME_PATTERNS)
@@ -85,13 +97,13 @@ class SmartLaunchDetector:
         # 检查“黄金信号”豁免机制
         has_golden_action = any(word in text for word in self.GOLDEN_ACTION_KEYWORDS)
         if has_golden_action and final_time_score > 0:
-            print("   -> 触发“黄金信号”豁免机制，直接判定为上新帖！")
+            print("    -> 触发“黄金信号”豁免机制，直接判定为上新帖！")
             return {"is_launch": True, "type": self._classify_type(text), "time": final_best_time, "action": best_action_word}
 
         # 检查“组合规则”
         for (word1, word2), score in self.COMBO_RULES.items():
             if word1 in text and word2 in text:
-                print("   -> 触发“组合规则”，判定为上新帖！")
+                print("    -> 触发“组合规则”，判定为上新帖！")
                 return {"is_launch": True, "type": self._classify_type(text), "time": "即时", "action": word1}
         
         # 如果未触发豁免，则进入常规评分流程
@@ -208,12 +220,12 @@ class WeiboDataParser:
             page_info = status['page_info']
             if page_info.get('page_pic') and isinstance(page_info['page_pic'], dict): add_image(page_info['page_pic'].get('url'))
             elif isinstance(page_info.get('page_pic'), str): add_image(page_info['page_pic'])
-            if page_info.get('media_info', {}).get('big_pic_info', {}).get('pic_big', {}).get('url'): add_image(page_info['media_info']['big_pic_info']['pic_big']['url'])
+            if page_info.get('media_info', {}).get('big_pic_info', {}).get('url'): add_image(page_info['media_info']['big_pic_info']['pic_big']['url'])
         if 'mix_media_info' in status and isinstance(status.get('mix_media_info'), dict):
             for item in status['mix_media_info'].get('items', []):
                 if item.get('type') == 'pic' and isinstance(item.get('data'), dict):
-                     for size in ['large', 'original', 'bmiddle', 'thumbnail']:
-                         if size in item['data'] and item['data'][size].get('url'): add_image(item['data'][size]['url']); break
+                    for size in ['large', 'original', 'bmiddle', 'thumbnail']:
+                        if size in item['data'] and item['data'][size].get('url'): add_image(item['data'][size]['url']); break
                 elif item.get('type') == 'video' and isinstance(item.get('data'), dict):
                     if item['data'].get('page_pic'): add_image(item['data']['page_pic'])
         possible_keys = ['thumbnail_pic', 'bmiddle_pic', 'original_pic', 'pic', 'cover_image_url']
@@ -264,7 +276,7 @@ def fetch_one_page_of_posts(sub_cookie: str, max_id: Optional[str] = None) -> Di
         response=requests.get(url,params=params,headers=headers,cookies=cookies,timeout=15, proxies=PROXIES_SETTING)
         return response.json()
     except Exception as e:
-        print(f"   - 网络请求异常: {e}")
+        print(f"    - 网络请求异常: {e}")
         return {}
 
 def fetch_weibo_data(sub_cookie: str, start_time: datetime, end_time: datetime) -> List[Dict[str, Any]]:
@@ -317,7 +329,7 @@ def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[s
     for post in launch_posts:
         text_content = format_launch_notification(post)
         if parser.send_wechat_text(text_content):
-            print(f"   ✅ 文本推送成功: {post['user']['screen_name']}")
+            print(f"    ✅ 文本推送成功: {post['user']['screen_name']}")
             time.sleep(1)
             images = post.get('media', {}).get('images', [])
             for i, image in enumerate(images[:2]):
@@ -326,7 +338,7 @@ def send_launch_notifications(parser: WeiboDataParser, launch_posts: List[Dict[s
                 else: print(f"      - 图片 {i+1} 发送失败")
                 time.sleep(0.5)
         else:
-            print(f"   ❌ 文本推送失败: {post['user']['screen_name']}")
+            print(f"    ❌ 文本推送失败: {post['user']['screen_name']}")
         time.sleep(2)
 
 def check_cookie_status(sub_cookie: str, current_statuses: List[Dict[str, Any]]) -> bool:
@@ -336,13 +348,13 @@ def check_cookie_status(sub_cookie: str, current_statuses: List[Dict[str, Any]])
     if 11<=current_hour<15: end_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0); start_time=end_time-timedelta(hours=4)
     elif 15<=current_hour<17: end_time=now_beijing.replace(hour=12,minute=0,second=0); start_time=(now_beijing-timedelta(days=1)).replace(hour=22,minute=0,second=0)
     else: end_time=now_beijing-timedelta(hours=6); start_time=now_beijing-timedelta(hours=12)
-    print(f"   - 正在回溯检查上一时间段...")
+    print(f"    - 正在回溯检查上一时间段...")
     previous_statuses = fetch_weibo_data(sub_cookie, start_time, end_time)
     if previous_statuses:
-        print("   ✅ 在上一时间段找到数据，判定Cookie有效，当前时段确实无新帖。")
+        print("    ✅ 在上一时间段找到数据，判定Cookie有效，当前时段确实无新帖。")
         return True
     else:
-        print("   ❌ 当前及上一时间段均未找到任何数据，判定Cookie或请求头已失效！")
+        print("    ❌ 当前及上一时间段均未找到任何数据，判定Cookie或请求头已失效！")
         return False
 
 def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enable_push: bool = True):
@@ -378,7 +390,7 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
 
     if launch_posts:
         print(f"✅ 识别成功！共找到 {len(launch_posts)} 条上新帖。")
-        for i,post in enumerate(launch_posts): print(f"   {i+1}. {post['user']['screen_name']}: {post['text_raw'][:50]}...")
+        for i,post in enumerate(launch_posts): print(f"    {i+1}. {post['user']['screen_name']}: {post['text_raw'][:50]}...")
         if enable_push: send_launch_notifications(parser,launch_posts)
         else: print("🚫 推送功能已禁用(--no-push)。")
     else: print("ℹ️ 本次运行未识别到任何上新帖。")
