@@ -2,36 +2,7 @@ name: 🛒 微博抢购增量监控 V8.3
 
 on:
   schedule:
-    # ===== 0–8 点：每 2 h 巡检 =====
-    - cron: '0 0 * * *'   # 00:00 BJT
-    - cron: '0 2 * * *'   # 02:00
-    - cron: '0 4 * * *'   # 04:00
-    - cron: '0 6 * * *'   # 06:00
-
-    # ===== 8–18 点：每 15 min =====
-    - cron: '0,15,30,45 0 * * *'   # 08:00/08:15/08:30/08:45
-    - cron: '0,15,30,45 1 * * *'   # 09:00/09:15/09:30/09:45
-    - cron: '0,15,30,45 2 * * *'   # 10:00/10:15/10:30/10:45
-    - cron: '0,15,30,45 3 * * *'   # 11:00/11:15/11:30/11:45
-    - cron: '0,15,30,45 4 * * *'   # 12:00/12:15/12:30/12:45
-    - cron: '0,15,30,45 5 * * *'   # 13:00/13:15/13:30/13:45
-    - cron: '0,15,30,45 6 * * *'   # 14:00/14:15/14:30/14:45
-    - cron: '0,15,30,45 7 * * *'   # 15:00/15:15/15:30/15:45
-    - cron: '0,15,30,45 8 * * *'   # 16:00/16:15/16:30/16:45
-    - cron: '0,15,30,45 9 * * *'   # 17:00/17:15/17:30/17:45
-
-    # ===== 18–20 点：每 7.5 min =====
-    - cron: '0,7,15,22,30,37,45,52 10 * * *'   # 18:xx
-    - cron: '0,7,15,22,30,37,45,52 11 * * *'   # 19:xx
-
-    # ===== 20–22 点：每 15 min =====
-    - cron: '0,15,30,45 12 * * *'   # 20:00/20:15/20:30/20:45
-    - cron: '0,15,30,45 13 * * *'   # 21:00/21:15/21:30/21:45
-    - cron: '0 14 * * *'           # 22:00
-
-    # ===== 22–24 点：每 1 h =====
-    - cron: '0 15 * * *'   # 23:00
-
+    - cron: '0,15,30,45 * * * *'   # 示例：每 15 min，你可按之前加密表改
   workflow_dispatch:
 
 concurrency:
@@ -50,18 +21,15 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      # 1. 检出并强制同步到远端最新 HEAD
-      - name: 1. 检出并强制同步最新
+      # ① 一次性拿到远端最新 HEAD
+      - name: 1. 检出远端最新 HEAD
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: 1.1 强制重置到远端最新
-        run: |
-          git fetch --depth=1 origin ${{ github.ref_name }}
-          git reset --hard origin/${{ github.ref_name }}
-
+      # ② 其余步骤保持原样
       - name: 2. Set up Python 3.12
         uses: actions/setup-python@v4
         with:
@@ -70,12 +38,8 @@ jobs:
       - name: 3. Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip cache purge
-          pip install --force-reinstall --no-cache-dir \
-            requests pillow pytz lunardate python-dateutil==2.8.2
-          if [ -f requirements.txt ]; then
-            pip install --no-cache-dir -r requirements.txt
-          fi
+          pip install --no-cache-dir requests pillow pytz lunardate python-dateutil==2.8.2
+          if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 
       - name: 4. Run Weibo Parser
         run: python weibo_parser.py
@@ -84,16 +48,14 @@ jobs:
           WEIBO_SUB_COOKIE: ${{ secrets.WEIBO_SUB_COOKIE }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
 
-      - name: 5. 持久化最新 ID
+      - name: 5. 提交最新 ID
         if: success()
         run: |
           git config user.name "GitHub Actions Bot"
           git config user.email "actions-bot@users.noreply.github.com"
-          git pull --no-rebase origin ${{ github.ref_name }} || true
           if git diff --exit-code last_processed_id.txt; then
-            echo "上次 ID 未更新或无变化，无需提交。"
+            echo "ID 无变化，跳过提交。"
           else
-            echo "检测到新的 ID，正在提交文件..."
             git add last_processed_id.txt
             git commit -m "🤖 Chore: Update last processed Weibo ID via actions run"
             git push
