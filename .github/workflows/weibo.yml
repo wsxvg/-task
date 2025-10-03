@@ -1,57 +1,63 @@
-name: 🛒 微博抢购增量监控 V8.3
+name: 🛒 微博抢购增量监控 V8.3 (修复版)
 
 on:
-  schedule:
-    - cron: '0,15,30,45 * * * *'   # 示例每 15 min，按你之前加密表改
-  workflow_dispatch:
+  schedule:
+    - cron: '0,15,30,45 * * * *'   # 示例每 15 min，按你之前加密表改
+  workflow_dispatch:
 
 concurrency:
-  group: weibo-check
-  cancel-in-progress: true
+  group: weibo-check
+  cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: write
 
 env:
-  TZ: Asia/Shanghai
+  TZ: Asia/Shanghai
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
 
-    steps:
-      - name: 1. 检出并拉到最新
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-      - run: git fetch --depth=1 origin && git reset --hard origin/${{ github.ref_name }} || true
+    steps:
+      - name: 1. 检出仓库（确保完整同步 latest_id）
+        uses: actions/checkout@v4
+        with:
+          # 确保检出正确的分支
+          ref: ${{ github.ref_name }}
+          # 强制完整克隆，避免浅克隆引起的同步问题 <--- 关键修复点
+          fetch-depth: 0 
+          
+      # ❗️ 移除了原来的 git fetch/reset 步骤，让 checkout@v4 完成所有工作。
 
-      - name: 2. Set up Python 3.12
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.12"
+      - name: 2. Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
 
-      - name: 3. Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir requests pillow pytz lunardate python-dateutil==2.8.2
-          if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+      - name: 3. Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir requests pillow pytz lunardate python-dateutil==2.8.2
+          if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 
-      - name: 4. Run Weibo Parser
-        run: python weibo_parser.py
-        env:
-          TZ: Asia/Shanghai
-          WEIBO_SUB_COOKIE: ${{ secrets.WEIBO_SUB_COOKIE }}
-          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+      - name: 4. Run Weibo Parser
+        run: python weibo_parser.py
+        env:
+          TZ: Asia/Shanghai
+          WEIBO_SUB_COOKIE: ${{ secrets.WEIBO_SUB_COOKIE }}
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
 
-      - name: 5. 强制提交最新 ID（无论有无 diff）
-        run: |
-          git config user.name "GitHub Actions Bot"
-          git config user.email "actions-bot@users.noreply.github.com"
-          # 强制 add，可能文件时间戳变
-          git add last_processed_id.txt
-          git commit -m "🤖 Chore: Update last processed Weibo ID via actions run" || true
-          git push || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 5. 强制提交最新 ID
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions-bot@users.noreply.github.com"
+          # 强制 add，确保文件被追踪
+          git add last_processed_id.txt
+          # 使用 --allow-empty 确保即使 ID 没变，也不会报错导致后续 push 失败 (可选，这里用 || true 效果相同)
+          git commit -m "🤖 Chore: Update last processed Weibo ID via actions run" || true
+          git push || true
+        env:
+          # GITHUB_TOKEN 是用于推送的关键权限
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
