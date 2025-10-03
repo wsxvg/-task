@@ -1,15 +1,14 @@
-name: 🛒 微博抢购增量监控 V8.3 (稳定运行版) # <--- 确保工作流名称存在
+name: 🛒 微博抢购增量监控 V8.3 (稳定运行版) # <-- 修复：确保工作流名称存在
 
 on:
   schedule:
     # GitHub Actions cron 使用 UTC 时间，比北京时间 (BJT) 晚 8 小时。
-    # 示例：'0 0 * * *' (UTC) 对应 '08:00' (BJT)
     
     # ===== 00–08 点 (BJT): 每 2 h 巡检 (UTC 16-24) =====
-    - cron: '0 16 * * *'   # 00:00 BJT
-    - cron: '0 18 * * *'   # 02:00
-    - cron: '0 20 * * *'   # 04:00
-    - cron: '0 22 * * *'   # 06:00
+    - cron: '0 16 * * *'    # 00:00 BJT
+    - cron: '0 18 * * *'    # 02:00
+    - cron: '0 20 * * *'    # 04:00
+    - cron: '0 22 * * *'    # 06:00
 
     # ===== 08–18 点 (BJT): 每 15 min (UTC 0-10) =====
     - cron: '0,15,30,45 0-9 * * *' # 08:00 - 17:45 BJT
@@ -19,18 +18,18 @@ on:
 
     # ===== 18–20 点 (BJT): 每 7.5 min (UTC 10-12) (已合并优化) =====
     # 如果要保留 18/19 点的密集度 (已修正为 UTC)：
-    - cron: '0,7,15,22,30,37,45,52 10 * * *'   # 18:xx BJT (UTC 10)
-    - cron: '0,7,15,22,30,37,45,52 11 * * *'   # 19:xx BJT (UTC 11)
+    - cron: '0,7,15,22,30,37,45,52 10 * * *'    # 18:xx BJT (UTC 10)
+    - cron: '0,7,15,22,30,37,45,52 11 * * *'    # 19:xx BJT (UTC 11)
 
     # ===== 20–22 点 (BJT): 每 15 min (UTC 12-14) =====
-    - cron: '0,15,30,45 12 * * *'   # 20:xx BJT (UTC 12)
-    - cron: '0,15,30,45 13 * * *'   # 21:xx BJT (UTC 13)
-    - cron: '0 14 * * *'           # 22:00 BJT (UTC 14)
+    - cron: '0,15,30,45 12 * * *'    # 20:xx BJT (UTC 12)
+    - cron: '0,15,30,45 13 * * *'    # 21:xx BJT (UTC 13)
+    - cron: '0 14 * * *'             # 22:00 BJT (UTC 14)
 
     # ===== 22–24 点 (BJT): 每 1 h (UTC 14-16) =====
-    - cron: '0 15 * * *'   # 23:00 BJT (UTC 15)
+    - cron: '0 15 * * *'    # 23:00 BJT
 
-  workflow_dispatch: # <--- 确保手动运行按钮存在
+  workflow_dispatch: # <-- 修复：确保手动运行按钮存在
 
 concurrency:
   group: weibo-check
@@ -53,10 +52,10 @@ jobs:
         with:
           # 确保检出正确的分支
           ref: ${{ github.ref_name }}
-          # 强制完整克隆，确保读取到最新的 last_processed_id.txt
+          # 强制完整克隆，确保读取到最新的 last_processed_id.txt <--- 关键修复
           fetch-depth: 0 
           
-      # ❗️ 移除了冗余的 '1.1 强制重置到远端最新' 步骤。
+      # ❗️ 移除了所有冗余的 git fetch/reset 步骤，依赖 fetch-depth: 0。
 
       - name: 2. Set up Python 3.12
         uses: actions/setup-python@v4
