@@ -36,7 +36,7 @@ on:
 
 concurrency:
   group: weibo-check
-  cancel-in-progress: true   # 新运行直接取消旧运行，防并发覆盖
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -47,16 +47,17 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20          # 压到 20 min 省额度
+    timeout-minutes: 20
 
     steps:
-      - name: 1. 检出并强制更新到最新
+      # 1. 检出并强制同步到远端最新 HEAD
+      - name: 1. 检出并强制同步最新
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
-          fetch-depth: 0          # 拿全分支历史，可选
+          fetch-depth: 0
 
-      - name: 1.1 强制同步最新提交
+      - name: 1.1 强制重置到远端最新
         run: |
           git fetch --depth=1 origin ${{ github.ref_name }}
           git reset --hard origin/${{ github.ref_name }}
@@ -88,7 +89,6 @@ jobs:
         run: |
           git config user.name "GitHub Actions Bot"
           git config user.email "actions-bot@users.noreply.github.com"
-          # 再拉一次防止并发 push 导致冲突
           git pull --no-rebase origin ${{ github.ref_name }} || true
           if git diff --exit-code last_processed_id.txt; then
             echo "上次 ID 未更新或无变化，无需提交。"
