@@ -21,13 +21,14 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      # ① 直接检出远端最新 HEAD，不再被 GITHUB_SHA 锁定
-      - name: 1. 检出远端最新 HEAD
+      # ① 裸分支名 → 自动追到远端最新 HEAD
+      - name: 1. 检出并追到最新
         uses: actions/checkout@v4
         with:
-          ref: origin/${{ github.ref_name }}
+          ref: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+      - run: git fetch --depth=1 origin && git reset --hard origin/${{ github.ref_name }} || true
 
       - name: 2. Set up Python 3.12
         uses: actions/setup-python@v4
