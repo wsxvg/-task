@@ -50,12 +50,13 @@ jobs:
     timeout-minutes: 20          # 压到 20 min 省额度
 
     steps:
-      - name: 1. 检出代码
+      - name: 1. 检出并强制更新到最新
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
+          fetch-depth: 0          # 拿全分支历史，可选
 
-      - name: 1.1 拉取最新提交（防止快照滞后）
+      - name: 1.1 强制同步最新提交
         run: |
           git fetch --depth=1 origin ${{ github.ref_name }}
           git reset --hard origin/${{ github.ref_name }}
