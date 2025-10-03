@@ -47,7 +47,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20          # 压到 20 min 省额度
+    timeout-minutes: 20
 
     steps:
       - name: 1. 检出代码
@@ -57,8 +57,6 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.12"
-          # 显式关闭缓存，避免残包
-          cache: false
 
       - name: 3. Install dependencies
         run: |
