@@ -1,63 +1,104 @@
-name: 🛒 微博抢购增量监控 V8.3 (修复版)
+name: 🛒 微博抢购增量监控 V8.3 (修复版 - 稳定ID读取)
 
 on:
-  schedule:
-    - cron: '0,15,30,45 * * * *'   # 示例每 15 min，按你之前加密表改
-  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron 使用 UTC 时间，比北京时间 (BJT) 晚 8 小时。
+    # 示例：'0 0 * * *' (UTC) 对应 '08:00' (BJT)
+    
+    # ===== 00–08 点 (BJT): 每 2 h 巡检 (UTC 16-24) =====
+    - cron: '0 16 * * *'   # 00:00 BJT
+    - cron: '0 18 * * *'   # 02:00
+    - cron: '0 20 * * *'   # 04:00
+    - cron: '0 22 * * *'   # 06:00
+
+    # ===== 08–18 点 (BJT): 每 15 min (UTC 0-10) =====
+    - cron: '0,15,30,45 0-9 * * *' # 08:00 - 17:45 BJT
+    
+    # 18:00 BJT (UTC 10) 单独处理
+    - cron: '0,15,30,45 10 * * *' # 18:00/18:15/18:30/18:45 BJT
+
+    # ===== 18–20 点 (BJT): 每 7.5 min (UTC 10-12) (已合并优化) =====
+    # 因为 GitHub cron 精度限制，无法做到精确 7.5 分钟。
+    # 保持原有的 15 分钟，或使用更密集的 5 分钟 (但会增加 Action 消耗)。
+    # 现有：'0,7,15,22,30,37,45,52 10/11 * * *' BJT 18/19点 - 
+    # 鉴于 Action 资源和稳定性，建议使用 5 分钟或 15 分钟间隔。
+    
+    # 如果要保留 18/19 点的密集度 (已修正为 UTC)：
+    - cron: '0,7,15,22,30,37,45,52 10 * * *'   # 18:xx BJT (UTC 10)
+    - cron: '0,7,15,22,30,37,45,52 11 * * *'   # 19:xx BJT (UTC 11)
+
+    # ===== 20–22 点 (BJT): 每 15 min (UTC 12-14) =====
+    - cron: '0,15,30,45 12 * * *'   # 20:xx BJT (UTC 12)
+    - cron: '0,15,30,45 13 * * *'   # 21:xx BJT (UTC 13)
+    - cron: '0 14 * * *'           # 22:00 BJT (UTC 14)
+
+    # ===== 22–24 点 (BJT): 每 1 h (UTC 14-16) =====
+    - cron: '0 15 * * *'   # 23:00 BJT (UTC 15)
+
+  workflow_dispatch:
 
 concurrency:
-  group: weibo-check
-  cancel-in-progress: true
+  group: weibo-check
+  cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: write # 确保有提交权限
 
 env:
-  TZ: Asia/Shanghai
+  TZ: Asia/Shanghai
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
 
-    steps:
-      - name: 1. 检出仓库（确保完整同步 latest_id）
-        uses: actions/checkout@v4
-        with:
-          # 确保检出正确的分支
-          ref: ${{ github.ref_name }}
-          # 强制完整克隆，避免浅克隆引起的同步问题 <--- 关键修复点
-          fetch-depth: 0 
-          
-      # ❗️ 移除了原来的 git fetch/reset 步骤，让 checkout@v4 完成所有工作。
+    steps:
+      - name: 1. 检出仓库（强制完整同步最新 ID）
+        uses: actions/checkout@v4
+        with:
+          # 确保检出正确的分支
+          ref: ${{ github.ref_name }}
+          # 强制完整克隆，确保读取到最新的 last_processed_id.txt <--- 关键修复
+          fetch-depth: 0 
+          
+      # ❗️ 移除冗余的 '1.1 强制重置到远端最新' 步骤，避免冲突和不稳定。
 
-      - name: 2. Set up Python 3.12
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.12"
+      - name: 2. Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
 
-      - name: 3. Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir requests pillow pytz lunardate python-dateutil==2.8.2
-          if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+      - name: 3. Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip cache purge # 清理缓存，确保环境干净
+          pip install --no-cache-dir requests pillow pytz python-dateutil==2.8.2
+          if [ -f requirements.txt ]; then
+            pip install --no-cache-dir -r requirements.txt
+          fi
 
-      - name: 4. Run Weibo Parser
-        run: python weibo_parser.py
-        env:
-          TZ: Asia/Shanghai
-          WEIBO_SUB_COOKIE: ${{ secrets.WEIBO_SUB_COOKIE }}
-          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+      - name: 4. Run Weibo Parser
+        run: python weibo_parser.py
+        env:
+          TZ: Asia/Shanghai
+          WEIBO_SUB_COOKIE: ${{ secrets.WEIBO_SUB_COOKIE }}
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
 
-      - name: 5. 强制提交最新 ID
-        run: |
-          git config user.name "GitHub Actions Bot"
-          git config user.email "actions-bot@users.noreply.github.com"
-          # 强制 add，确保文件被追踪
-          git add last_processed_id.txt
-          # 使用 --allow-empty 确保即使 ID 没变，也不会报错导致后续 push 失败 (可选，这里用 || true 效果相同)
-          git commit -m "🤖 Chore: Update last processed Weibo ID via actions run" || true
-          git push || true
-        env:
-          # GITHUB_TOKEN 是用于推送的关键权限
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 5. 提交最新 ID
+        # 仅在 Python 脚本运行成功后执行
+        if: success()
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions-bot@users.noreply.github.com"
+          
+          # 检查文件是否有变化
+          if git diff --exit-code last_processed_id.txt; then
+            echo "上次 ID 未更新或无变化，无需提交。"
+          else
+            echo "检测到新的 ID，正在提交文件..."
+            git add last_processed_id.txt
+            git commit -m "🤖 Chore: Update last processed Weibo ID via actions run"
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
