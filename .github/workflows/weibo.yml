@@ -21,13 +21,10 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      # ① 裸分支名 → 自动追到远端最新 HEAD
-      - name: 1. 检出并追到最新
+      - name: 1. 检出并拉到最新
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
       - run: git fetch --depth=1 origin && git reset --hard origin/${{ github.ref_name }} || true
 
       - name: 2. Set up Python 3.12
@@ -48,17 +45,13 @@ jobs:
           WEIBO_SUB_COOKIE: ${{ secrets.WEIBO_SUB_COOKIE }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
 
-      - name: 5. 提交最新 ID
-        if: success()
+      - name: 5. 强制提交最新 ID（无论有无 diff）
         run: |
           git config user.name "GitHub Actions Bot"
           git config user.email "actions-bot@users.noreply.github.com"
-          if git diff --exit-code last_processed_id.txt; then
-            echo "ID 无变化，跳过提交。"
-          else
-            git add last_processed_id.txt
-            git commit -m "🤖 Chore: Update last processed Weibo ID via actions run"
-            git push
-          fi
+          # 强制 add，可能文件时间戳变
+          git add last_processed_id.txt
+          git commit -m "🤖 Chore: Update last processed Weibo ID via actions run" || true
+          git push || true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
