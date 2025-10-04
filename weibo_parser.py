@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V8.3 (高频运行版 - 增强关键词与调试输出 - 已优化媒体和评分)
+微博API数据解析器 V8.3.1 (高频运行版 - 增强组合模式识别与时间提取)
 """
 import json
 import re
@@ -18,7 +18,7 @@ from io import BytesIO
 from typing import Dict, List, Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from dateutil import parser    # 确保解析微博时间更稳
+from dateutil import parser  # 确保解析微博时间更稳
 
 try:
     from PIL import Image
@@ -68,6 +68,13 @@ class SmartLaunchDetector:
         # 关键词定义...
         # 🚀 优化 1: 终极信号 - 添加'释放库存'，直接识别最高优先级
         self.ULTIMATE_LAUNCH_KEYWORDS = {'现货上架', '已上架', '已开售', '开启购买', '释放库存'}
+        
+        # 🚀 优化 5: 新增高分组合模式，解决识别被负分淹没和时间提取不完整的问题
+        self.LAUNCH_PATTERNS = {
+            # 模式 A: (今/明/后/周/日期) + [任意字符] + (精确时间点: 8点/20:00) + [任意字符] + (动作词)
+            r'(今|明|后|本周|下周|周[一二三四五六日天]|\d{1,2}[./]\d{1,2}|\d{1,2}号).*?(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点).*?(上架|开售|发售|补款|释放|开拍|提前购|会员先购)': 80,
+        }
+        
         self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35,
                                      '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25,
                                      '本周': 20, '本周末': 25, '月底': 20, '准时': 10,
@@ -97,8 +104,8 @@ class SmartLaunchDetector:
         
         # 🚀 优化 3: 黄金信号 - 添加 '释放' 和 '上架'
         self.GOLDEN_ACTION_KEYWORDS = ['上新通知', '现货上架', '开启购买', '会员先购',
-                                         'VIP先购', '提前购', '补货', '发售', '开售', 
-                                         '补款', '付尾款', '释放', '上架'] # <<< 调整: 添加 '上架'
+                                             'VIP先购', '提前购', '补货', '发售', '开售', 
+                                             '补款', '付尾款', '释放', '上架'] # <<< 调整: 添加 '上架'
         self.COMBO_RULES = {
             ('已上架', '网页链接'): 50, ('已上架', 'http'): 50,
             ('新款', '讲解'): 15, ('新款', '细节'): 15,
@@ -138,6 +145,7 @@ class SmartLaunchDetector:
         for k, v in kw.items():
             if k in text:
                 tmp = v + (bonus if k in text[:35] else 0)
+                # 修复点：确保取的是最大得分的关键词
                 if tmp > s:
                     s, w = tmp, k
         return s, w
@@ -146,11 +154,14 @@ class SmartLaunchDetector:
         s, m = 0, ''
         for p, v in pt.items():
             match = re.search(p, text)
-            if match and v > s:
-                s, m = v, match.group(0)
+            if match:
+                # 修复点：确保取的是最大得分的模式
+                if v > s:
+                    s, m = v, match.group(0)
         return s, m
 
     def _calculate_total_score(self, text: str) -> int:
+        # 注意: LAUNCH_PATTERNS 的分值也会计算到 t1 或 t2 中，如果启用了组合模式，这里的分数会很高
         t1, _ = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
         t2, _ = self._calculate_pattern_score(text, self.TIME_PATTERNS)
         a1, _ = self._calculate_score(text, self.ACTION_KEYWORDS, 10)
@@ -161,7 +172,16 @@ class SmartLaunchDetector:
         for (w1, w2), v in self.COMBO_RULES.items():
             if w1 in text and w2 in text:
                 combo += v
-        return max(t1, t2) + a1 + neg + pol + lot + combo
+        
+        # 组合模式的分数直接体现在 max(t1, t2) 中（因为 LAUNCH_PATTERNS 会被 check() 优先处理，
+        # 如果走到这里，只计算常规的 ACTION_KEYWORDS 和 TIME_PATTERNS）
+        
+        # 将 LAUNCH_PATTERNS 分数单独计算并计入，以确保它能在阈值检测中发挥作用，
+        # 即使它在 check() 中没有被单独处理，也能通过总分。
+        combo_score_total, _ = self._calculate_pattern_score(text, self.LAUNCH_PATTERNS)
+        
+        # 如果 combo_score_total 很高 (如 80)，则直接将其计入总分
+        return max(t1, t2, combo_score_total) + a1 + neg + pol + lot + combo
 
     def check(self, text: str) -> Union[bool, Dict[str, Any]]:
         if not text:
@@ -171,10 +191,18 @@ class SmartLaunchDetector:
         for w in self.ULTIMATE_LAUNCH_KEYWORDS:
             if w in text:
                 logger.info(f'  -> 触发“终极信号”({w})，直接判定为上新帖！')
-                logger.info(f'  [匹配内容]：{text[:150]}...') # <--- 调试输出
+                logger.info(f'  [匹配内容]：{text[:150]}...')
                 return {'is_launch': True, 'type': self._classify_type(text),
                         'time': '即时', 'action': w}
         
+        # 0. 【新增】高分组合模式检测 (赋予最高优先级)
+        combo_score, combo_match = self._calculate_pattern_score(text, self.LAUNCH_PATTERNS)
+        if combo_score >= self.SCORE_THRESHOLD:
+            logger.info(f'  -> 触发“高分组合模式” ({combo_match})，得分 {combo_score}，直接判定为上新帖！')
+            # 使用整个匹配内容作为提取的时间
+            return {'is_launch': True, 'type': self._classify_type(text),
+                    'time': combo_match, 'action': '组合判断'}
+            
         # 计算得分
         t_score, t_word = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
         pt_score, pt_word = self._calculate_pattern_score(text, self.TIME_PATTERNS)
@@ -187,7 +215,7 @@ class SmartLaunchDetector:
         if is_golden_action and max(t_score, pt_score) > 0:
             logger.info('    -> 触发“黄金信号”豁免机制，直接判定为上新帖！')
             logger.info(f'    [匹配动作]：{a_word} | [匹配时间]：{best_time} | [总分]：{total}')
-            logger.info(f'    [匹配内容]：{text[:150]}...') # <--- 调试输出
+            logger.info(f'    [匹配内容]：{text[:150]}...')
             return {'is_launch': True, 'type': self._classify_type(text),
                     'time': best_time, 'action': a_word}
         
@@ -195,7 +223,7 @@ class SmartLaunchDetector:
         if total >= self.SCORE_THRESHOLD:
             logger.info(f'    -> 命中阈值！总分：{total} (阈值 {self.SCORE_THRESHOLD})')
             logger.info(f'    [匹配动作]：{a_word} | [匹配时间]：{best_time}')
-            logger.info(f'    [匹配内容]：{text[:150]}...') # <--- 调试输出
+            logger.info(f'    [匹配内容]：{text[:150]}...')
             return {'is_launch': True, 'type': self._classify_type(text),
                     'time': best_time, 'action': a_word}
         
@@ -235,7 +263,7 @@ class WeiboDataParser:
     def _resolve_short_link(self, short: str) -> Optional[str]:
         try:
             return requests.head(short, allow_redirects=True, timeout=10,
-                                     proxies=PROXIES_SETTING).url
+                                 proxies=PROXIES_SETTING).url
         except Exception:
             return None
 
@@ -276,8 +304,8 @@ class WeiboDataParser:
             
             # 如果不是长微博，使用原始短文本
             if 'text_raw' not in s:
-                 s['text_raw'] = s.get('text', '')
-                 s['text_raw'] = re.sub(r'<[^>]+>', '', s['text_raw']).strip()
+                s['text_raw'] = s.get('text', '')
+                s['text_raw'] = re.sub(r'<[^>]+>', '', s['text_raw']).strip()
 
 
             item = self._parse_single_status(s)
@@ -322,8 +350,8 @@ class WeiboDataParser:
         # 确保这里获取的是纯净的文本
         text_raw = s.get('text_raw', '')
         if not text_raw:
-             text_raw = s.get('text', '')
-             text_raw = re.sub(r'<[^>]+>', '', text_raw).strip()
+            text_raw = s.get('text', '')
+            text_raw = re.sub(r'<[^>]+>', '', text_raw).strip()
 
         return {
             'id': s.get('idstr', s.get('id')),
@@ -529,7 +557,7 @@ def fetch_weibo_data(sub_cookie: str, start: datetime, end: datetime) -> List[Di
                 if post_time < start:
                     # 如果帖子时间早于窗口开始时间，则后面的帖子通常也早于此时间，可以停止分页
                     logger.info(f'🔍 遇到时间过早的帖子 ({post_time.strftime("%H:%M:%S")})，停止分页。')
-                    return all_stat 
+                    return all_stat
                 
                 if post_time <= end:
                     all_stat.append(s)
@@ -555,14 +583,44 @@ def format_launch_notification(info: Dict[str, Any]) -> str:
     user = info['user']['screen_name']
     detail = info.get('launch_details', {})
     lt = info.get('created_at', '')
+    
+    # 【优化部分开始】优化预告时间提取
+    raw_time = detail.get('time', '')
+    detail_time = raw_time
+    
+    # 如果是通过组合模式匹配到的
+    if raw_time and detail.get('action') == '组合判断':
+        # 清理动作词（上架|开售|发售|...）和可能的标点、空格
+        action_words_pattern = r'(上架|开售|发售|补款|释放|开拍|提前购|会员先购|\s*[:：,.。，]\s*)$'
+        clean_time = re.sub(action_words_pattern, '', raw_time)
+        detail_time = clean_time.strip()
+    
+    # 如果是单个时间词/模式（如 明晚, 20:00），尝试回溯文本提取上下文
+    elif raw_time and len(raw_time) <= 6: # 长度限制，只对较短的匹配词进行上下文扩展
+        idx = info['text_raw'].find(raw_time)
+        if idx != -1:
+            # 向前和向后扩展一些字符，以获取上下文 (例如 12个字符)
+            start_idx = max(0, idx - 8)
+            end_idx = min(len(info['text_raw']), idx + len(raw_time) + 8)
+            context = info['text_raw'][start_idx:end_idx]
+            
+            # 使用正则提取 "今晚/明晚 + 时间" 模式
+            match = re.search(r'(今晚|明晚|明天|今天|周[一二三四五六日天]).*?(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点)', context)
+            if match:
+                detail_time = match.group(0).strip()
+    # 【优化部分结束】
+    
     t = f'🕒 发帖时间: {lt}\n' if lt else ''
     tp = detail.get('type', '上新动态')
     title = f'🛍️【{tp} | {user}】'
     lines = [title]
-    if detail.get('time'):
-        lines.append(f'⏰ 预告时间: {detail["time"]}')
-    if detail.get('action'):
+    
+    if detail_time: # 使用经过美化或增强的 detail_time
+        lines.append(f'⏰ 预告时间: {detail_time}')
+    
+    if detail.get('action') and detail.get('action') != '组合判断': # 避免对“组合判断”显示动作
         lines.append(f'🔑 动作: {detail["action"]}')
+        
     key_str = '\n'.join(lines)
     
     # 清理并截断内容
