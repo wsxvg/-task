@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V8.3 (稳定版 - 修复 ID 读取与增强补款关键词)
+微博API数据解析器 V8.3 (高频运行版 - 增强关键词与调试输出)
 """
 import json
 import re
@@ -62,11 +62,12 @@ def save_last_id(new_id: str):
     except Exception as e:
         logger.error(f'❌ 写入 last_processed_id.txt 失败: {e}')
 
-# ---------- 智能评分器 (已优化补款关键词) ----------
+# ---------- 智能评分器 (已优化关键词和调试输出) ----------
 class SmartLaunchDetector:
     def __init__(self):
         # 关键词定义...
-        self.ULTIMATE_LAUNCH_KEYWORDS = {'现货上架', '已上架', '已开售', '开启购买'}
+        # 🚀 优化 1: 终极信号 - 添加'释放库存'，直接识别最高优先级
+        self.ULTIMATE_LAUNCH_KEYWORDS = {'现货上架', '已上架', '已开售', '开启购买', '释放库存'}
         self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35,
                                      '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25,
                                      '本周': 20, '本周末': 25, '月底': 20, '准时': 10,
@@ -75,25 +76,27 @@ class SmartLaunchDetector:
                                r'(\d{4}[-/年])?\d{1,2}[-/月]\d{1,2}日?': 30, r'\d{1,2}\.\d{1,2}': 30,
                                r'\d{1,2}号': 25, r'周[一二三四五六日天]': 25}
         
-        # 🚀 增强关键词：添加补款/付尾款关键词
+        # 🚀 优化 2: 提升 '释放' 关键词分值
         self.ACTION_KEYWORDS = {
             '现货上架': 40, '开启购买': 35, '会员先购': 35, 'VIP先购': 35, '补货': 35,
             '提前购': 35, '开拍': 30, '上架': 30, '发售': 30, '开售': 30, '现货': 30,
             
-            '补款': 40,          # 针对补款/支付尾款，极高优先级
-            '付尾款': 40,         # 针对尾款的关键词
-            '补定金': 35,         # 有时会用“补定金”来代替“补款”
+            '补款': 40,          
+            '付尾款': 40,         
+            '补定金': 35,         
             
             '清仓': 30, '新款': 25, '讲解': 15, '细节': 15, '上新': 25,
-            '释放': 25, '预售': 25, '先购': 25, '开放购买': 25, '上新通知': 25,
+            '释放': 35, # ← 分值从 25 提升到 35，重要性提高
+            '预售': 25, '先购': 25, '开放购买': 25, '上新通知': 25,
             '新品首发': 25, '补出': 20, '已开售': 20, '已上架': 20, '新品上市': 20,
             '新款预告': 15, '首批': 15, '第一批': 15, '🆕': 15,
             '更新了': 10, '带来了': 10, '带给大家': 10
         }
         
-        # 🚀 更新黄金关键词列表
+        # 🚀 优化 3: 黄金信号 - 添加 '释放'
         self.GOLDEN_ACTION_KEYWORDS = ['上新通知', '现货上架', '开启购买', '会员先购',
-                                       'VIP先购', '提前购', '补货', '发售', '开售', '补款', '付尾款']
+                                       'VIP先购', '提前购', '补货', '发售', '开售', 
+                                       '补款', '付尾款', '释放']
         self.COMBO_RULES = {
             ('已上架', '网页链接'): 50, ('已上架', 'http'): 50,
             ('新款', '讲解'): 15, ('新款', '细节'): 15,
@@ -157,23 +160,38 @@ class SmartLaunchDetector:
     def check(self, text: str) -> Union[bool, Dict[str, Any]]:
         if not text:
             return False
+        
+        # 1. 终极信号检测
         for w in self.ULTIMATE_LAUNCH_KEYWORDS:
             if w in text:
                 logger.info(f'  -> 触发“终极信号”({w})，直接判定为上新帖！')
+                logger.info(f'  [匹配内容]：{text[:150]}...') # <--- 调试输出
                 return {'is_launch': True, 'type': self._classify_type(text),
                         'time': '即时', 'action': w}
+        
+        # 计算得分
         t_score, t_word = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
         pt_score, pt_word = self._calculate_pattern_score(text, self.TIME_PATTERNS)
         a_score, a_word = self._calculate_score(text, self.ACTION_KEYWORDS, 10)
         best_time = t_word if t_score >= pt_score else pt_word
+        total = self._calculate_total_score(text)
+        
+        # 2. 黄金信号检测 (动作+时间)
         if any(k in text for k in self.GOLDEN_ACTION_KEYWORDS) and max(t_score, pt_score) > 0:
             logger.info('    -> 触发“黄金信号”豁免机制，直接判定为上新帖！')
+            logger.info(f'    [匹配动作]：{a_word} | [匹配时间]：{best_time} | [总分]：{total}')
+            logger.info(f'    [匹配内容]：{text[:150]}...') # <--- 调试输出
             return {'is_launch': True, 'type': self._classify_type(text),
                     'time': best_time, 'action': a_word}
-        total = self._calculate_total_score(text)
+        
+        # 3. 阈值检测
         if total >= self.SCORE_THRESHOLD:
+            logger.info(f'    -> 命中阈值！总分：{total} (阈值 {self.SCORE_THRESHOLD})')
+            logger.info(f'    [匹配动作]：{a_word} | [匹配时间]：{best_time}')
+            logger.info(f'    [匹配内容]：{text[:150]}...') # <--- 调试输出
             return {'is_launch': True, 'type': self._classify_type(text),
                     'time': best_time, 'action': a_word}
+        
         return False
 
 # ---------- 微博解析核心 (与原代码一致) ----------
@@ -245,22 +263,31 @@ class WeiboDataParser:
             if s.get('readtimetype') == 'adMblog':
                 continue
             post_id = s['idstr']
+            # 将获取到的全文注入到原始数据中
             if post_id in long_map:
                 s['text_raw'] = long_map[post_id]
+            
+            # 如果不是长微博，使用原始短文本
+            if 'text_raw' not in s:
+                 s['text_raw'] = s.get('text', '')
+                 s['text_raw'] = re.sub(r'<[^>]+>', '', s['text_raw']).strip()
+
+
             item = self._parse_single_status(s)
+            
             if item:
+                # 在这里对每个帖子进行初步的关键词检查，并嵌入结果
+                check_result = self.detector.check(item['text_raw'])
+                if isinstance(check_result, dict) and check_result.get('is_launch'):
+                    item['launch_details'] = check_result
+                
                 item['real_links'] = self._extract_and_resolve_links(item['text_raw'])
                 parsed.append(item)
         return parsed
 
+    # 这里的 filter_launch_posts 现在只负责筛选已打上标记的帖子
     def filter_launch_posts(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        launches = []
-        for d in data:
-            r = self.detector.check(d.get('text_raw', ''))
-            if isinstance(r, dict) and r.get('is_launch'):
-                d['launch_details'] = r
-                launches.append(d)
-        return launches
+        return [d for d in data if d.get('launch_details')]
 
     def _parse_single_status(self, s: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
@@ -274,14 +301,20 @@ class WeiboDataParser:
             if is_ret:
                 basic['original_text_raw'] = obj.get('text_raw', '')
             return {**basic, 'user': user, 'interaction': inter,
-                    'media': media, 'original_user': ori_user}
+                    'media': media, 'original_user': ori_user, 'text_raw': basic['text_raw']}
         except Exception:
             return None
 
     def _parse_basic(self, s, is_ret):
+        # 确保这里获取的是纯净的文本
+        text_raw = s.get('text_raw', '')
+        if not text_raw:
+             text_raw = s.get('text', '')
+             text_raw = re.sub(r'<[^>]+>', '', text_raw).strip()
+
         return {
             'id': s.get('idstr', s.get('id')),
-            'text_raw': s.get('text_raw', ''),
+            'text_raw': text_raw,
             'created_at': self._parse_time(s.get('created_at')),
             'source': re.sub(r'<[^>]+>', '', s.get('source', '')).strip(),
             'is_retweet': is_ret
@@ -483,8 +516,8 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
     now_beijing = datetime.now(beijing)
     current_hour = now_beijing.hour
 
-    # 动态窗口
-    hours_back = 2 if 8 <= current_hour <= 23 else 8
+    # 动态窗口 (高频运行，窗口可小一点)
+    hours_back = 1 if 8 <= current_hour <= 23 else 4
     start_time = now_beijing - timedelta(hours=hours_back, minutes=5)
     end_time = now_beijing
     logger.info(f'📅 设定回溯窗口: {start_time.strftime("%Y-%m-%d %H:%M")} → {end_time.strftime("%Y-%m-%d %H:%M")} (最近 {hours_back} 小时)')
@@ -511,6 +544,7 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
 
     # 增量过滤
     new_statuses = [s for s in raw_statuses if int(s.get('idstr', '0')) > last_id]
+    
     if not new_statuses:
         logger.info('ℹ️ 所有帖子 ID 均不大于上次记录，无新帖需要处理。')
         return 
@@ -521,14 +555,33 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
     logger.info(f'\n📊 共获得 {len(raw_statuses)} 条微博，其中 {len(new_statuses)} 条为新帖。')
 
     parser = WeiboDataParser(sub_cookie, webhook_url)
+    
+    # --- 3. 解析与调试打印 (在解析中已打上 launch_details 标记) ---
     parsed = parser.parse_and_enrich(new_statuses)
+    
+    logger.info('🔍 开始调试打印所有新帖内容...')
+    for p in parsed:
+        is_launch = 'YES' if p.get('launch_details') else 'NO'
+        
+        # 提取关键信息用于打印
+        user = p['user']['screen_name']
+        text_preview = p['text_raw'][:150].replace('\n', ' ') + ('...' if len(p['text_raw']) > 150 else '')
+        
+        logger.info(f'  [ID: {p["id"]}] [用户: {user}] [上新判定: {is_launch}]')
+        logger.info(f'  [内容]: {text_preview}')
+        
+    logger.info('--- 调试打印结束 ---')
+
+    # --- 4. 过滤和推送 ---
+    # 这里的 filter_launch_posts 只是筛选出在 parse_and_enrich 阶段已打上标记的帖子
     launches = parser.filter_launch_posts(parsed)
 
     if launches:
         logger.info(f'✅ 识别成功！共找到 {len(launches)} 条上新帖。')
         if enable_push:
-            send_launch_notifications(parser, launches)
+            send_launch_notifications(parser, launches) 
 
+    # --- 5. 更新 ID ---
     save_last_id(current_max_id_str)
     logger.info(f'💾 已将最新 ID ({current_max_id_str}) 写入 last_processed_id.txt，等待 Git 提交。')
     logger.info('\n🏁 所有任务执行完毕。')
