@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V8.3 (修复 ID 读取逻辑)
+微博API数据解析器 V8.3 (稳定版 - 修复 ID 读取与增强补款关键词)
 """
 import json
 import re
@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 def load_last_id() -> str:
     """从 last_processed_id.txt 读取上次处理的 ID，如果文件不存在或内容非法则返回 '0'。"""
     try:
+        # 修复点：只读取一次并strip
         with open('last_processed_id.txt', 'r', encoding='utf-8') as f:
-            content = f.read().strip()  # ⬅️ 修复点：只读取一次
+            content = f.read().strip()
             # 确保内容是数字
             return content if content.isdigit() else '0'
     except Exception:
@@ -61,7 +62,7 @@ def save_last_id(new_id: str):
     except Exception as e:
         logger.error(f'❌ 写入 last_processed_id.txt 失败: {e}')
 
-# ---------- 智能评分器 (略，与原代码一致) ----------
+# ---------- 智能评分器 (已优化补款关键词) ----------
 class SmartLaunchDetector:
     def __init__(self):
         # 关键词定义...
@@ -73,17 +74,26 @@ class SmartLaunchDetector:
         self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30,
                                r'(\d{4}[-/年])?\d{1,2}[-/月]\d{1,2}日?': 30, r'\d{1,2}\.\d{1,2}': 30,
                                r'\d{1,2}号': 25, r'周[一二三四五六日天]': 25}
+        
+        # 🚀 增强关键词：添加补款/付尾款关键词
         self.ACTION_KEYWORDS = {
             '现货上架': 40, '开启购买': 35, '会员先购': 35, 'VIP先购': 35, '补货': 35,
             '提前购': 35, '开拍': 30, '上架': 30, '发售': 30, '开售': 30, '现货': 30,
+            
+            '补款': 40,          # 针对补款/支付尾款，极高优先级
+            '付尾款': 40,         # 针对尾款的关键词
+            '补定金': 35,         # 有时会用“补定金”来代替“补款”
+            
             '清仓': 30, '新款': 25, '讲解': 15, '细节': 15, '上新': 25,
             '释放': 25, '预售': 25, '先购': 25, '开放购买': 25, '上新通知': 25,
             '新品首发': 25, '补出': 20, '已开售': 20, '已上架': 20, '新品上市': 20,
             '新款预告': 15, '首批': 15, '第一批': 15, '🆕': 15,
             '更新了': 10, '带来了': 10, '带给大家': 10
         }
+        
+        # 🚀 更新黄金关键词列表
         self.GOLDEN_ACTION_KEYWORDS = ['上新通知', '现货上架', '开启购买', '会员先购',
-                                       'VIP先购', '提前购', '补货', '发售', '开售']
+                                       'VIP先购', '提前购', '补货', '发售', '开售', '补款', '付尾款']
         self.COMBO_RULES = {
             ('已上架', '网页链接'): 50, ('已上架', 'http'): 50,
             ('新款', '讲解'): 15, ('新款', '细节'): 15,
@@ -98,10 +108,12 @@ class SmartLaunchDetector:
                                  '觉得': -40, '喜欢吗': -50}
         self.LOTTERY_KEYWORDS = {'抽奖': -40, '转发': -20, '参与条件': -30, '抽取': -40}
         self.SCORE_THRESHOLD = 45
+        
+        # 🚀 优化分类：将补款归类到开启预售
         self.TYPE_KEYWORDS = {
             '新品首发': ['新品首发', '全新', '新款', '新品上市', '新款上线', '首批'],
             '热门补货': ['补货', '补出', '秒空', '返场'],
-            '开启预售': ['预售', '开启预售', '意向金', '尺码登记'],
+            '开启预售': ['预售', '开启预售', '意向金', '尺码登记', '补款', '付尾款'], 
             '清仓活动': ['清仓'],
             '现货发售': ['现货', '上架', '发售', '释放', '开售']
         }
@@ -164,7 +176,7 @@ class SmartLaunchDetector:
                     'time': best_time, 'action': a_word}
         return False
 
-# ---------- 微博解析核心 (略，与原代码一致) ----------
+# ---------- 微博解析核心 (与原代码一致) ----------
 class WeiboDataParser:
     def __init__(self, sub_cookie: str, webhook_url: Optional[str] = None):
         self.sub_cookie = sub_cookie
@@ -361,7 +373,7 @@ class WeiboDataParser:
             logger.error(f'❌ 图片推送异常: {e}')
             return False
 
-# ---------- 外部 API (略，与原代码一致) ----------
+# ---------- 外部 API (与原代码一致) ----------
 def fetch_one_page(sub_cookie: str, max_id: Optional[str] = None) -> Dict[str, Any]:
     url = 'https://weibo.com/ajax/feed/groupstimeline'
     params = {'list_id': GROUP_ID, 'count': '50'}
@@ -479,7 +491,7 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
 
     last_id_str = load_last_id()
     last_id = int(last_id_str) if last_id_str.isdigit() else 0
-    logger.info(f'➡️ 上次处理 ID: {last_id}') # 确认这里能读取到正确 ID
+    logger.info(f'➡️ 上次处理 ID: {last_id}') 
 
     raw_statuses = fetch_weibo_data(sub_cookie, start_time, end_time)
 
