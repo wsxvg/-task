@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V8.3.2 (终极增强版 - 预售豁免与负面排除优化)
+微博API数据解析器 V8.3.3 (终极增强版 - 移除抽奖负分)
 """
 import json
 import re
@@ -59,16 +59,16 @@ def save_last_id(new_id: str):
     except Exception as e:
         logger.error(f'❌ 写入 last_processed_id.txt 失败: {e}')
 
-# ---------- 智能评分器 (应用了所有优化) ----------
+# ---------- 智能评分器 (应用了所有优化，并删除了抽奖负分) ----------
 class SmartLaunchDetector:
     def __init__(self):
         # 终极信号，直接判定
         self.ULTIMATE_LAUNCH_KEYWORDS = {'现货上架', '已上架', '已开售', '开启购买', '释放库存'}
         
-        # 🚀 优化 1: 高分组合模式 (模式 A)，解决识别被负分淹没和时间提取不完整的问题
-        # 赋予 80 分，确保超过阈值 45
+        # 🚀 优化 1 & 鲁棒性增强: 高分组合模式
+        # 鲁棒性增强: 提升到 85 分，并允许时间点和动作词之间有最多 20 个字符的间隔。
         self.LAUNCH_PATTERNS = {
-            r'(今|明|后|本周|下周|周[一二三四五六日天]|\d{1,2}[./]\d{1,2}|\d{1,2}号).*?(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点).*?(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售)': 80,
+            r'(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点).*?(\S{0,20}).*?(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售)': 85,
         }
         
         # 时间关键词
@@ -86,15 +86,15 @@ class SmartLaunchDetector:
             '现货上架': 40, '会员先购': 35, 'VIP先购': 35, '补货': 35, '提前购': 35, '开拍': 30, 
             '上架': 35,
             
-            '发售': 25,      # 关键调整: 从 30 降到 25，防止 '现在' 这种低分时间词凑成 45 分
-            '开售': 25,      # 关键调整: 从 30 降到 25
+            '发售': 25,      # 调整: 从 30 降到 25
+            '开售': 25,      # 调整: 从 30 降到 25
             '现货': 30,
             
-            '补款': 45,      # 关键调整: 提升到 45 (预售豁免所需)
-            '付尾款': 45,    # 关键调整: 提升到 45
+            '补款': 45,      # 调整: 提升到 45
+            '付尾款': 45,    # 调整: 提升到 45
             '开启购买': 50, 
-            '开启预售': 50,  # 确保能达到阈值
-            '预售': 45,      # 关键调整: 提升到 45 (预售豁免所需)
+            '开启预售': 50,
+            '预售': 45,      # 调整: 提升到 45
             '第二批预售': 45,
             
             '清仓': 30, '新款': 25, '讲解': 15, '细节': 15, '上新': 25,
@@ -104,31 +104,34 @@ class SmartLaunchDetector:
             '更新了': 10, '带来了': 10, '带给大家': 10
         }
         
-        # 🚀 优化 3: 黄金信号关键词 (解决被抽奖负分抵消的问题，特别是预售)
+        # 🚀 优化 3: 黄金信号关键词 (用于触发豁免，确保预售/现货不错失)
         self.GOLDEN_ACTION_KEYWORDS = ['上新通知', '现货上架', '开启购买', '会员先购',
                                              'VIP先购', '提前购', '补货', '发售', '开售', 
                                              '补款', '付尾款', '释放', '上架',
-                                             '预售', '开启预售'] # 关键调整: 加入预售/补款
+                                             '预售', '开启预售']
         self.COMBO_RULES = {
             ('已上架', '网页链接'): 50, ('已上架', 'http'): 50,
             ('新款', '讲解'): 15, ('新款', '细节'): 15,
         }
         
-        # 🚀 优化 4: 负面关键词 (解决排雷帖误报问题)
+        # 🚀 优化 4: 负面关键词 (用于排除排雷帖、进度帖)
         self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30,
                                      '确认': -30, '开发': -40, '研究': -40, '还在': -20,
                                      '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10,
                                      '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20,
                                      '计划': -50, '预计': -15, '准备': -20, '快了': -20,
                                      '即将': -20, '近期': -30, '延迟': -60, '取消': -60, '停止': -60,
-                                     '避雷': -35,      # 关键调整: 新增排雷
+                                     '避雷': -35,
                                      '科普': -20,
                                      '测评': -20,
                                      '教别人做': -40,
                                      '对比': -20}
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50,
                                      '觉得': -40, '喜欢吗': -50}
-        self.LOTTERY_KEYWORDS = {'抽奖': -40, '转发': -20, '参与条件': -30, '抽取': -40}
+        
+        # 🚨 关键修改: 删除抽奖负分 (解决抽奖帖被错误排除的问题)
+        self.LOTTERY_KEYWORDS = {}
+        
         self.SCORE_THRESHOLD = 45
         
         # 分类关键词
@@ -170,19 +173,19 @@ class SmartLaunchDetector:
         a1, _ = self._calculate_score(text, self.ACTION_KEYWORDS, 10)
         neg = sum(v for k, v in self.NEGATIVE_KEYWORDS.items() if k in text)
         pol = sum(v for k, v in self.POLLING_KEYWORDS.items() if k in text)
-        lot = sum(v for k, v in self.LOTTERY_KEYWORDS.items() if k in text)
+        
+        # 抽奖负分 LOTTERY_KEYWORDS 已被清空，这里计算结果为 0
+        lot = sum(v for k, v in self.LOTTERY_KEYWORDS.items() if k in text) 
+        
         combo = 0
         for (w1, w2), v in self.COMBO_RULES.items():
             if w1 in text and w2 in text:
                 combo += v
         
-        # 将 LAUNCH_PATTERNS 分数作为时间分的一部分
         combo_score_total, _ = self._calculate_pattern_score(text, self.LAUNCH_PATTERNS)
         
-        # 总分 = Max(时间分, 组合时间分) + 动作分 + 所有负面分 + 组合规则分
         return max(t1, t2, combo_score_total) + a1 + neg + pol + lot + combo
 
-    # 🚀 优化 5: check 方法中优先处理高分组合模式
     def check(self, text: str) -> Union[bool, Dict[str, Any]]:
         if not text:
             return False
@@ -194,28 +197,28 @@ class SmartLaunchDetector:
                 return {'is_launch': True, 'type': self._classify_type(text),
                         'time': '即时', 'action': w}
         
-        # 0. 【新增】高分组合模式检测 (赋予最高优先级)
+        # 2. 高分组合模式检测 (赋予最高优先级)
         combo_score, combo_match = self._calculate_pattern_score(text, self.LAUNCH_PATTERNS)
         if combo_score >= self.SCORE_THRESHOLD:
             logger.info(f'  -> 触发“高分组合模式” ({combo_match})，得分 {combo_score}，直接判定为上新帖！')
             return {'is_launch': True, 'type': self._classify_type(text),
                     'time': combo_match, 'action': '组合判断'}
             
-        # 计算得分
+        # 计算得分（用于黄金信号和阈值）
         t_score, t_word = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
         pt_score, pt_word = self._calculate_pattern_score(text, self.TIME_PATTERNS)
         a_score, a_word = self._calculate_score(text, self.ACTION_KEYWORDS, 10)
         best_time = t_word if t_score >= pt_score else pt_word
-        total = self._calculate_total_score(text)
         
-        # 2. 黄金信号检测 (动作+时间) - **预售豁免**体现在此
+        # 3. 黄金信号检测 (动作+时间) - 命中即豁免
         is_golden_action = any(k in text for k in self.GOLDEN_ACTION_KEYWORDS)
         if is_golden_action and max(t_score, pt_score) > 0:
             logger.info('    -> 触发“黄金信号”豁免机制，直接判定为上新帖！')
             return {'is_launch': True, 'type': self._classify_type(text),
                     'time': best_time, 'action': a_word}
         
-        # 3. 阈值检测
+        # 4. 阈值检测
+        total = self._calculate_total_score(text)
         if total >= self.SCORE_THRESHOLD:
             logger.info(f'    -> 命中阈值！总分：{total} (阈值 {self.SCORE_THRESHOLD})')
             return {'is_launch': True, 'type': self._classify_type(text),
@@ -223,17 +226,14 @@ class SmartLaunchDetector:
         
         return False
 
-# ---------- 微博解析核心 (与原代码一致) ----------
+# ---------- 微博解析核心 ----------
 class WeiboDataParser:
     def __init__(self, sub_cookie: str, webhook_url: Optional[str] = None):
         self.sub_cookie = sub_cookie
         self.webhook_url = webhook_url
         self.detector = SmartLaunchDetector()
 
-    # (私有工具和核心解析方法保持不变，省略以保持简洁，但请确保你的版本包含它们)
-
     def _fetch_full_text(self, post_id: str) -> Optional[Dict[str, Any]]:
-        # ... (保持不变) ...
         time.sleep(random.uniform(0.3, 0.8))
         url = 'https://weibo.com/ajax/statuses/longtext'
         params = {'id': post_id}
@@ -277,7 +277,6 @@ class WeiboDataParser:
         return reals
 
     def parse_and_enrich(self, statuses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        # ... (保持不变) ...
         long_posts = [s for s in statuses if s.get('isLongText')]
         long_map = {}
         if long_posts:
@@ -466,9 +465,8 @@ class WeiboDataParser:
             logger.error(f'❌ 图片推送异常: {e}')
             return False
 
-# ---------- 外部 API (与原代码一致) ----------
+# ---------- 外部 API ----------
 def fetch_one_page(sub_cookie: str, max_id: Optional[str] = None) -> Dict[str, Any]:
-    # ... (保持不变) ...
     url = 'https://weibo.com/ajax/feed/groupstimeline'
     params = {'list_id': GROUP_ID, 'count': '50'}
     if max_id:
@@ -495,7 +493,6 @@ def fetch_one_page(sub_cookie: str, max_id: Optional[str] = None) -> Dict[str, A
         return {}
 
 def fetch_weibo_data(sub_cookie: str, start: datetime, end: datetime) -> List[Dict[str, Any]]:
-    # ... (保持不变) ...
     all_stat = []
     max_id = None
     for page in range(PAGE_LIMIT):
@@ -541,13 +538,13 @@ def fetch_weibo_data(sub_cookie: str, start: datetime, end: datetime) -> List[Di
     logger.info(f'🏁 数据抓取完毕，共获得 {len(all_stat)} 条微博。')
     return all_stat
 
-# 🚀 优化 6: 格式化通知函数 (解决时间提取不完整的问题)
+# 格式化通知函数
 def format_launch_notification(info: Dict[str, Any]) -> str:
     user = info['user']['screen_name']
     detail = info.get('launch_details', {})
     lt = info.get('created_at', '')
     
-    # 【优化部分开始】优化预告时间提取
+    # 优化预告时间提取
     raw_time = detail.get('time', '')
     detail_time = raw_time
     
@@ -562,17 +559,13 @@ def format_launch_notification(info: Dict[str, Any]) -> str:
     elif raw_time and len(raw_time) <= 6:
         idx = info['text_raw'].find(raw_time)
         if idx != -1:
-            # 向前和向后扩展上下文
             start_idx = max(0, idx - 8)
             end_idx = min(len(info['text_raw']), idx + len(raw_time) + 8)
             context = info['text_raw'][start_idx:end_idx]
             
-            # 使用正则提取 "今晚/明晚 + 时间" 模式
             match = re.search(r'(今晚|明晚|明天|今天|周[一二三四五六日天]).*?(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点)', context)
             if match:
                 detail_time = match.group(0).strip()
-    
-    # 【优化部分结束】
     
     t = f'🕒 发帖时间: {lt}\n' if lt else ''
     tp = detail.get('type', '上新动态')
@@ -609,7 +602,6 @@ def format_launch_notification(info: Dict[str, Any]) -> str:
     return msg
 
 def send_launch_notifications(parser: WeiboDataParser, posts: List[Dict[str, Any]]):
-    # ... (保持不变) ...
     logger.info(f'\n📨 开始推送 {len(posts)} 条上新预告到企业微信...')
     for p in posts:
         text = format_launch_notification(p)
@@ -635,7 +627,6 @@ def send_launch_notifications(parser: WeiboDataParser, posts: List[Dict[str, Any
         time.sleep(2)
 
 def check_cookie_status(sub_cookie: str, curr: List[Dict[str, Any]]) -> bool:
-    # ... (保持不变) ...
     if curr:
         return True
     logger.warning('⚠️ 当前窗口未抓到任何帖子，启动 Cookie 二次验证...')
@@ -653,7 +644,6 @@ def check_cookie_status(sub_cookie: str, curr: List[Dict[str, Any]]) -> bool:
 
 # ---------- 主监控逻辑 ----------
 def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enable_push: bool = True):
-    # ... (保持不变) ...
     beijing = pytz.timezone('Asia/Shanghai')
     now_beijing = datetime.now(beijing)
     current_hour = now_beijing.hour
