@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V8.3.3 (终极增强版 - 移除抽奖负分)
+微博API数据解析器 V8.3.4 (终极增强版 - 移除抽奖负分并按时间正序推送)
 """
 import json
 import re
@@ -59,14 +59,13 @@ def save_last_id(new_id: str):
     except Exception as e:
         logger.error(f'❌ 写入 last_processed_id.txt 失败: {e}')
 
-# ---------- 智能评分器 (应用了所有优化，并删除了抽奖负分) ----------
+# ---------- 智能评分器 (V8.3.4) ----------
 class SmartLaunchDetector:
     def __init__(self):
         # 终极信号，直接判定
         self.ULTIMATE_LAUNCH_KEYWORDS = {'现货上架', '已上架', '已开售', '开启购买', '释放库存'}
         
-        # 🚀 优化 1 & 鲁棒性增强: 高分组合模式
-        # 鲁棒性增强: 提升到 85 分，并允许时间点和动作词之间有最多 20 个字符的间隔。
+        # 鲁棒性增强: 高分组合模式
         self.LAUNCH_PATTERNS = {
             r'(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点).*?(\S{0,20}).*?(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售)': 85,
         }
@@ -81,7 +80,7 @@ class SmartLaunchDetector:
                               r'(\d{4}[-/年])?\d{1,2}[-/月]\d{1,2}日?': 30, r'\d{1,2}\.\d{1,2}': 30,
                               r'\d{1,2}号': 25, r'周[一二三四五六日天]': 25}
         
-        # 🚀 优化 2: 动作关键词 (解决预售未识别/排雷帖误报问题)
+        # 动作关键词
         self.ACTION_KEYWORDS = {
             '现货上架': 40, '会员先购': 35, 'VIP先购': 35, '补货': 35, '提前购': 35, '开拍': 30, 
             '上架': 35,
@@ -90,11 +89,11 @@ class SmartLaunchDetector:
             '开售': 25,      # 调整: 从 30 降到 25
             '现货': 30,
             
-            '补款': 45,      # 调整: 提升到 45
-            '付尾款': 45,    # 调整: 提升到 45
+            '补款': 45,      
+            '付尾款': 45,    
             '开启购买': 50, 
             '开启预售': 50,
-            '预售': 45,      # 调整: 提升到 45
+            '预售': 45,      
             '第二批预售': 45,
             
             '清仓': 30, '新款': 25, '讲解': 15, '细节': 15, '上新': 25,
@@ -104,7 +103,7 @@ class SmartLaunchDetector:
             '更新了': 10, '带来了': 10, '带给大家': 10
         }
         
-        # 🚀 优化 3: 黄金信号关键词 (用于触发豁免，确保预售/现货不错失)
+        # 黄金信号关键词 (用于触发豁免)
         self.GOLDEN_ACTION_KEYWORDS = ['上新通知', '现货上架', '开启购买', '会员先购',
                                              'VIP先购', '提前购', '补货', '发售', '开售', 
                                              '补款', '付尾款', '释放', '上架',
@@ -114,7 +113,7 @@ class SmartLaunchDetector:
             ('新款', '讲解'): 15, ('新款', '细节'): 15,
         }
         
-        # 🚀 优化 4: 负面关键词 (用于排除排雷帖、进度帖)
+        # 负面关键词
         self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30,
                                      '确认': -30, '开发': -40, '研究': -40, '还在': -20,
                                      '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10,
@@ -129,7 +128,7 @@ class SmartLaunchDetector:
         self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50,
                                      '觉得': -40, '喜欢吗': -50}
         
-        # 🚨 关键修改: 删除抽奖负分 (解决抽奖帖被错误排除的问题)
+        # 🚨 关键修改: 删除抽奖负分
         self.LOTTERY_KEYWORDS = {}
         
         self.SCORE_THRESHOLD = 45
@@ -173,8 +172,6 @@ class SmartLaunchDetector:
         a1, _ = self._calculate_score(text, self.ACTION_KEYWORDS, 10)
         neg = sum(v for k, v in self.NEGATIVE_KEYWORDS.items() if k in text)
         pol = sum(v for k, v in self.POLLING_KEYWORDS.items() if k in text)
-        
-        # 抽奖负分 LOTTERY_KEYWORDS 已被清空，这里计算结果为 0
         lot = sum(v for k, v in self.LOTTERY_KEYWORDS.items() if k in text) 
         
         combo = 0
@@ -602,7 +599,11 @@ def format_launch_notification(info: Dict[str, Any]) -> str:
     return msg
 
 def send_launch_notifications(parser: WeiboDataParser, posts: List[Dict[str, Any]]):
-    logger.info(f'\n📨 开始推送 {len(posts)} 条上新预告到企业微信...')
+    
+    # 🚨 关键修改: 将列表倒序，确保在微信中按时间正序输出（旧 -> 新）
+    posts.reverse()
+    
+    logger.info(f'\n📨 开始推送 {len(posts)} 条上新预告到企业微信 (按时间正序)...')
     for p in posts:
         text = format_launch_notification(p)
         if parser.send_wechat_text(text):
