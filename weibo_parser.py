@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V8.3.4 (终极增强版 - 移除抽奖负分并按时间正序推送)
+微博API数据解析器 V8.3.4 (终极增强版 - 移除抽奖负分并按时间正序推送，增强图片防盗链)
 """
 import json
 import re
@@ -398,11 +398,11 @@ class WeiboDataParser:
             
             video_url = page_info.get('media_info', {}).get('mp4_720p_mp4')
             if not video_url:
-                 video_url = page_info.get('media_info', {}).get('mp4_hd_url')
+                video_url = page_info.get('media_info', {}).get('mp4_hd_url')
             if not video_url:
-                 video_url = page_info.get('media_info', {}).get('stream_url')
+                video_url = page_info.get('media_info', {}).get('stream_url')
             if not video_url:
-                 video_url = page_info.get('media_info', {}).get('playback_url')
+                video_url = page_info.get('media_info', {}).get('playback_url')
 
 
             if video_url:
@@ -417,26 +417,48 @@ class WeiboDataParser:
             
         return media
 
+    # ------------------------------------------------------------------
+    # 💥 核心修改部分：增强图片下载的 Headers 以绕过防盗链
+    # ------------------------------------------------------------------
     def download_and_convert_image(self, url: str) -> Optional[Dict[str, str]]:
         if not Image:
             return None
         try:
-            headers = {'Referer': 'https://weibo.com/', 'User-Agent': 'Mozilla/5.0'}
+            # 完整复制 curl 命令中模拟浏览器行为的请求头
+            # 关键是 Referer 和 User-Agent
+            headers = {
+                "Referer": "https://weibo.com/", # 核心防盗链绕过
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0", 
+                "sec-ch-ua-platform": "\"Windows\"",
+                "sec-ch-ua": "\"Microsoft Edge\";v=\"120\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"120\"",
+                "sec-ch-ua-mobile": "?0",
+            }
+            
             r = requests.get(url, headers=headers, timeout=10, proxies=PROXIES_SETTING)
+            
             if r.status_code != 200:
+                if r.status_code == 403:
+                     logger.warning(f'⚠️ 图片下载失败 (403 Forbidden)，可能是请求头仍被阻止。URL: {url[:80]}...')
                 return None
+            
             data = r.content
+            
+            # 图片压缩/处理逻辑不变
             if len(data) > 2 * 1024 * 1024:
                 img = Image.open(BytesIO(data))
                 img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
                 buf = BytesIO()
                 img.save(buf, format='JPEG', quality=85)
                 data = buf.getvalue()
+                
             return {'base64': base64.b64encode(data).decode('utf-8'),
                     'md5': hashlib.md5(data).hexdigest()}
+            
         except Exception as e:
             logger.error(f'❌ 图片下载/压缩失败 (URL: {url[:80]}...): {e}')
             return None
+    # ------------------------------------------------------------------
+
 
     def send_wechat_text(self, text: str) -> bool:
         if not self.webhook_url:
@@ -678,7 +700,7 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
     
     if not new_statuses:
         logger.info('ℹ️ 所有帖子 ID 均不大于上次记录，无新帖需要处理。')
-        return 
+        return  
 
     current_max_id = max(int(s['idstr']) for s in new_statuses)
     current_max_id_str = str(current_max_id)
@@ -698,12 +720,12 @@ def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enabl
         
         # 调试输出详细得分
         if not p.get('launch_details'):
-             total_score = parser.detector._calculate_total_score(p['text_raw'])
-             logger.info(f'  [ID: {p["id"]}] [用户: {user}] [上新判定: NO] (总分: {total_score}) {media_summary}')
+              total_score = parser.detector._calculate_total_score(p['text_raw'])
+              logger.info(f'  [ID: {p["id"]}] [用户: {user}] [上新判定: NO] (总分: {total_score}) {media_summary}')
         else:
-             time_word = p['launch_details'].get('time', 'N/A')
-             action_word = p['launch_details'].get('action', 'N/A')
-             logger.info(f'  [ID: {p["id"]}] [用户: {user}] [上新判定: YES] (时间: {time_word} / 动作: {action_word}) {media_summary}')
+            time_word = p['launch_details'].get('time', 'N/A')
+            action_word = p['launch_details'].get('action', 'N/A')
+            logger.info(f'  [ID: {p["id"]}] [用户: {user}] [上新判定: YES] (时间: {time_word} / 动作: {action_word}) {media_summary}')
         
         logger.info(f'  [内容]: {text_preview}')
         
