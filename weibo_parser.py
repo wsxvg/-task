@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V8.3.4 (终极增强版 - 移除抽奖负分并按时间正序推送，增强图片防盗链)
+微博API数据解析器 V8.3.6 (修复视频封面获取 - 增强防盗链版)
 """
 import json
 import re
@@ -59,15 +59,19 @@ def save_last_id(new_id: str):
     except Exception as e:
         logger.error(f'❌ 写入 last_processed_id.txt 失败: {e}')
 
-# ---------- 智能评分器 (V8.3.4) ----------
+# ---------- 智能评分器 (V8.3.5) ----------
 class SmartLaunchDetector:
     def __init__(self):
         # 终极信号，直接判定
         self.ULTIMATE_LAUNCH_KEYWORDS = {'现货上架', '已上架', '已开售', '开启购买', '释放库存'}
         
-        # 鲁棒性增强: 高分组合模式
+        # 鲁棒性增强: 高分组合模式 (V8.3.5 增强特惠、售价、秒杀捕获)
         self.LAUNCH_PATTERNS = {
-            r'(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点).*?(\S{0,20}).*?(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售)': 85,
+            # 匹配 "19:00...动作"
+            r'(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点).*?(\S{0,20}).*?(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售|售价|特惠|抢购|秒杀)': 85,
+            
+            # 新增: 匹配 "今晚 19:00" 这种明确的时间描述，即便后面动作词弱
+            r'(今晚|明晚|今天|明天|周[一二三四五六日天]).*?(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点)': 40, 
         }
         
         # 时间关键词
@@ -80,13 +84,13 @@ class SmartLaunchDetector:
                               r'(\d{4}[-/年])?\d{1,2}[-/月]\d{1,2}日?': 30, r'\d{1,2}\.\d{1,2}': 30,
                               r'\d{1,2}号': 25, r'周[一二三四五六日天]': 25}
         
-        # 动作关键词
+        # 动作关键词 (V8.3.5 增强特惠和售价)
         self.ACTION_KEYWORDS = {
             '现货上架': 40, '会员先购': 35, 'VIP先购': 35, '补货': 35, '提前购': 35, '开拍': 30, 
             '上架': 35,
             
-            '发售': 25,      # 调整: 从 30 降到 25
-            '开售': 25,      # 调整: 从 30 降到 25
+            '发售': 25,      
+            '开售': 25,      
             '现货': 30,
             
             '补款': 45,      
@@ -95,6 +99,13 @@ class SmartLaunchDetector:
             '开启预售': 50,
             '预售': 45,      
             '第二批预售': 45,
+            
+            '特惠': 45,       # 🌟 增强
+            '售价': 45,       # 🌟 增强
+            '抢购': 40,       # 🌟 增强
+            '秒杀': 40,       # 🌟 增强
+            '开团': 35,       # 🌟 增强
+            '预定': 35,       # 🌟 增强
             
             '清仓': 30, '新款': 25, '讲解': 15, '细节': 15, '上新': 25,
             '释放': 35, 
@@ -107,7 +118,7 @@ class SmartLaunchDetector:
         self.GOLDEN_ACTION_KEYWORDS = ['上新通知', '现货上架', '开启购买', '会员先购',
                                              'VIP先购', '提前购', '补货', '发售', '开售', 
                                              '补款', '付尾款', '释放', '上架',
-                                             '预售', '开启预售']
+                                             '预售', '开启预售', '特惠', '售价', '抢购'] # 🌟 增强
         self.COMBO_RULES = {
             ('已上架', '网页链接'): 50, ('已上架', 'http'): 50,
             ('新款', '讲解'): 15, ('新款', '细节'): 15,
@@ -146,6 +157,8 @@ class SmartLaunchDetector:
         for t, ks in self.TYPE_KEYWORDS.items():
             if any(k in text for k in ks):
                 return t
+        if '特惠' in text or '售价' in text or '抢购' in text:
+            return '优惠活动' # 🌟 新增分类
         return '上新动态'
 
     def _calculate_score(self, text: str, kw: Dict[str, int], bonus: int = 0) -> (int, str):
@@ -268,9 +281,9 @@ class WeiboDataParser:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
             f2s = {exe.submit(self._resolve_short_link, s): s for s in set(shorts)}
             for f in as_completed(f2s):
-                url = f.result()
-                if url:
-                    reals.append(url)
+                res = f.result()
+                if res:
+                    reals.append(res)
         return reals
 
     def parse_and_enrich(self, statuses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -372,11 +385,17 @@ class WeiboDataParser:
 
         def add_img(url: str):
             if url and url.startswith('http') and url not in seen_urls:
+                # 尝试将缩略图替换为大图
                 if 'thumb180' in url and 'large' not in url:
                     url = url.replace('thumb180', 'large')
+                # 尝试将 orj480/or360 等替换为 orj1080/orj2000，以获取更高清封面
+                # (V8.3.6 优化)
+                url = re.sub(r'orj\d{2,4}', 'orj1080', url) 
+                
                 media['images'].append({'url': url})
                 seen_urls.add(url)
         
+        # 1. 解析普通图片
         pic_infos = s.get('pic_infos', {})
         for pid in s.get('pic_ids', []):
             if pid in pic_infos:
@@ -388,14 +407,24 @@ class WeiboDataParser:
                 if found_url:
                     add_img(found_url)
 
+        # 2. 解析视频信息和封面 (V8.3.6 核心修复点)
         page_info = s.get('page_info', {})
-        if page_info.get('type') == 'video':
-            cover_url = None
-            if page_info.get('page_pic'):
-                cover_url = page_info['page_pic'].get('url')
-                if cover_url:
-                    add_img(cover_url)
+        cover_url = None
+        
+        # 从 page_info.page_pic 提取封面 URL
+        if page_info.get('page_pic'):
+            # 兼容 page_pic 是字符串（常见）或字典（少见）的情况
+            if isinstance(page_info['page_pic'], dict) and page_info['page_pic'].get('url'):
+                cover_url = page_info['page_pic']['url']
+            elif isinstance(page_info['page_pic'], str):
+                cover_url = page_info['page_pic']
             
+        # 如果获取到封面 URL，将其添加到 images 列表中，以便推送
+        if cover_url:
+            add_img(cover_url)
+
+        if page_info.get('type') == 'video':
+            # 视频 URL 获取逻辑
             video_url = page_info.get('media_info', {}).get('mp4_720p_mp4')
             if not video_url:
                 video_url = page_info.get('media_info', {}).get('mp4_hd_url')
@@ -407,7 +436,8 @@ class WeiboDataParser:
 
             if video_url:
                 media['videos'].append({'url': video_url, 'cover_url': cover_url})
-
+                
+        # 3. 兜底和冗余图片信息
         big_pic_info = s.get('big_pic_info', {})
         if big_pic_info.get('url'):
             add_img(big_pic_info['url'])
@@ -416,16 +446,15 @@ class WeiboDataParser:
             add_img(s['bmiddle_pic'])
             
         return media
-
+    
     # ------------------------------------------------------------------
-    # 💥 核心修改部分：增强图片下载的 Headers 以绕过防盗链
+    # 💥 增强图片下载的 Headers 以绕过防盗链
     # ------------------------------------------------------------------
     def download_and_convert_image(self, url: str) -> Optional[Dict[str, str]]:
         if not Image:
             return None
         try:
-            # 完整复制 curl 命令中模拟浏览器行为的请求头
-            # 关键是 Referer 和 User-Agent
+            # 模拟浏览器行为的请求头
             headers = {
                 "Referer": "https://weibo.com/", # 核心防盗链绕过
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0", 
@@ -534,6 +563,10 @@ def fetch_weibo_data(sub_cookie: str, start: datetime, end: datetime) -> List[Di
                     continue
                     
                 post_time = parser.parse(s['created_at'])
+                # 微博API返回的时间已经是本地化或带时区信息的，但为了精确比较，
+                # 最好确保 start 和 end 也是带时区的。
+                # 由于程序在 `execute_monitoring` 中已经将 start/end 设定为带时区(北京时间)，这里是安全的。
+
                 if post_time < start:
                     logger.info(f'🔍 遇到时间过早的帖子 ({post_time.strftime("%H:%M:%S")})，停止分页。')
                     return all_stat
@@ -570,7 +603,7 @@ def format_launch_notification(info: Dict[str, Any]) -> str:
     # 逻辑 1: 如果是通过组合模式匹配到的 (e.g., "明日晚八点上架")
     if raw_time and detail.get('action') == '组合判断':
         # 清理动作词和可能的标点
-        action_words_pattern = r'(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售|\s*[:：,.。，]\s*)$'
+        action_words_pattern = r'(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售|售价|特惠|抢购|秒杀|\s*[:：,.。，]\s*)$' 
         clean_time = re.sub(action_words_pattern, '', raw_time)
         detail_time = clean_time.strip()
     
@@ -582,7 +615,8 @@ def format_launch_notification(info: Dict[str, Any]) -> str:
             end_idx = min(len(info['text_raw']), idx + len(raw_time) + 8)
             context = info['text_raw'][start_idx:end_idx]
             
-            match = re.search(r'(今晚|明晚|明天|今天|周[一二三四五六日天]).*?(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点)', context)
+            # 增强: 确保能够捕获 '今晚19:00' 这种完美组合
+            match = re.search(r'(今晚|明晚|明天|今天|周[一二三四五六日天]).*?(\d{1,2}([:：]\d{2}|\.\d{2}|点)|[0-9一二三四五六七八九十]+点)', context)
             if match:
                 detail_time = match.group(0).strip()
     
@@ -612,7 +646,7 @@ def format_launch_notification(info: Dict[str, Any]) -> str:
     video_info = info.get('media', {}).get('videos', [])
     video_str = ''
     if video_info:
-        video_url = video_info[0]['url']
+        # 注意: 视频封面在 send_launch_notifications 中会作为图片单独发送
         video_str = f'\n\n🎥 **[含视频]**\n(请在浏览器打开链接查看视频)'
         if len(video_info) > 1:
             video_str += f' (共 {len(video_info)} 个视频)'
@@ -632,18 +666,16 @@ def send_launch_notifications(parser: WeiboDataParser, posts: List[Dict[str, Any
             logger.info(f'    ✅ 文本推送成功: {p["user"]["screen_name"]} ({p["id"]})')
             time.sleep(1)
             
+            # 尝试发送图片（包括视频封面图）
             images_to_send = p.get('media', {}).get('images', [])
-            if not images_to_send and p.get('media', {}).get('videos'):
-                cover_url = p['media']['videos'][0].get('cover_url')
-                if cover_url:
-                    images_to_send = [{'url': cover_url}]
             
+            # 仅发送 1~2 张图片，太多容易刷屏
             for i, img in enumerate(images_to_send[:2]):
                 ii = parser.download_and_convert_image(img['url'])
                 if ii and parser.send_wechat_image(ii):
                     logger.info(f'      - 图片 {i+1} 发送成功')
                 else:
-                    logger.warning(f'      - 图片 {i+1} 发送失败或下载失败')
+                    logger.warning(f'      - 图片 {i+1} 发送失败或下载失败 (URL: {img["url"][:80]}...)')
                 time.sleep(0.5)
         else:
             logger.error(f'    ❌ 文本推送失败: {p["user"]["screen_name"]} ({p["id"]})')
