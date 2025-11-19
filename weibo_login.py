@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-微博自动扫码登录助手 V1.0
+微博自动扫码登录助手 V1.0 (完整无省略)
 """
 import requests
 import time
@@ -9,6 +9,7 @@ import hashlib
 import re
 import os
 import sys
+import json
 
 # 从环境变量读取 Webhook
 WEBHOOK_URL = os.getenv('WECHAT_WEBHOOK_URL')
@@ -16,17 +17,18 @@ WEBHOOK_URL = os.getenv('WECHAT_WEBHOOK_URL')
 class WeiboQRLogin:
     def __init__(self):
         self.session = requests.Session()
-        # 模拟浏览器环境，防风控
+        # 模拟浏览器环境，防风控，基于你提供的抓包数据
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
             "Referer": "https://passport.weibo.com/sso/signin",
-            "Origin": "https://passport.weibo.com"
+            "Origin": "https://passport.weibo.com",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
         }
         # 1. 初始化 Session (获取基础 CSRF Token)
         try:
-            self.session.get("https://passport.weibo.com/sso/signin", headers=self.headers, timeout=10)
-        except Exception:
-            pass
+            self.session.get("https://passport.weibo.com/sso/signin", headers=self.headers, timeout=15)
+        except Exception as e:
+            print(f"⚠️ 初始化连接失败: {e}")
 
     def send_wechat_msg(self, msg_type, data):
         """发送企业微信通知"""
@@ -35,8 +37,8 @@ class WeiboQRLogin:
             return False
         try:
             payload = {"msgtype": msg_type, msg_type: data}
-            requests.post(WEBHOOK_URL, json=payload, timeout=10)
-            return True
+            r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+            return r.status_code == 200
         except Exception as e:
             print(f"❌ 微信推送失败: {e}")
             return False
@@ -58,7 +60,7 @@ class WeiboQRLogin:
         """
         轮询状态
         返回: (状态码, 数据)
-        1: 成功, 2: 过期, 0: 等待
+        1: 成功, 2: 过期, 0: 等待/错误
         """
         check_url = "https://passport.weibo.com/sso/v2/qrcode/check"
         params = {
@@ -69,7 +71,15 @@ class WeiboQRLogin:
         }
         try:
             r = self.session.get(check_url, params=params, headers=self.headers, timeout=10)
-            resp = r.json()
+            # 微博可能返回 jsonp 格式，或者直接 json
+            try:
+                resp = r.json()
+            except:
+                # 简单的 jsonp 解析
+                content = r.text
+                json_str = content[content.find('(')+1 : content.rfind(')')]
+                resp = json.loads(json_str)
+
             retcode = resp.get('retcode')
             
             if retcode == 20000000:
@@ -78,24 +88,26 @@ class WeiboQRLogin:
                 return 2, "Expired"
             else:
                 return 0, "Waiting"
-        except Exception:
+        except Exception as e:
+            # print(f"Debug check error: {e}")
             return 0, "Error"
 
     def login_and_get_sub(self, redirect_url):
         """访问跳转链接提取 SUB"""
         try:
             # 访问跨域登录 URL，自动 Set-Cookie
-            r = self.session.get(redirect_url, headers=self.headers, allow_redirects=True, timeout=10)
+            # 这里一定要 allow_redirects=True，因为可能会多次跳转
+            r = self.session.get(redirect_url, headers=self.headers, allow_redirects=True, timeout=15)
             
             # 1. 优先从 CookieJar 获取
             sub = self.session.cookies.get('SUB', domain='.weibo.com') or \
                   self.session.cookies.get('SUB', domain='.sina.com.cn') or \
                   self.session.cookies.get('SUB')
 
-            # 2. 兜底：从响应文本或 Header 提取
+            # 2. 兜底：从响应文本或 Header 提取 (针对你提供的抓包情况)
             if not sub:
-                # 你的抓包显示 Set-Cookie: SUB=...
                 import re
+                # 在 header 或 body 里寻找 SUB=xxxx;
                 match = re.search(r'SUB=([^;&"\']+)', str(r.headers) + r.text)
                 if match:
                     sub = match.group(1)
@@ -107,8 +119,8 @@ class WeiboQRLogin:
 
     def run_login_process(self):
         """执行完整的登录流程"""
-        print("🔄 启动自动登录流程...")
-        max_duration = 900  # 最多运行 15 分钟
+        print("🔄 [LoginBot] 启动自动登录流程...")
+        max_duration = 850  # 最多运行 14分多钟，给 Action 留点缓冲
         start_time = time.time()
         
         while time.time() - start_time < max_duration:
@@ -118,7 +130,7 @@ class WeiboQRLogin:
                 time.sleep(5)
                 continue
             
-            print(f"📤 获取二维码成功 (ID: {qrid})，正在发送...")
+            print(f"📤 [LoginBot] 获取二维码成功 (ID: {qrid})，正在发送...")
             
             # 2. 下载并发送图片
             try:
@@ -126,30 +138,45 @@ class WeiboQRLogin:
                 b64_data = base64.b64encode(img_data).decode('utf-8')
                 md5_val = hashlib.md5(img_data).hexdigest()
                 
+                # 发送图片
                 self.send_wechat_msg("image", {"base64": b64_data, "md5": md5_val})
-                self.send_wechat_msg("text", {"content": "⚠️ 微博 Cookie 已失效！\n请在 1-2 分钟内扫描二维码。\n(若过期脚本会自动刷新发新的)"})
+                # 发送提示
+                self.send_wechat_msg("text", {"content": "⚠️ 微博 Cookie 已失效！\n请打开微博APP扫描上方二维码。\n(若过期脚本会自动刷新发新的，请耐心等待)"})
             except Exception as e:
-                print(f"❌ 发送图片失败: {e}")
+                print(f"❌ [LoginBot] 发送图片失败: {e}")
             
             # 3. 轮询检查
             qr_is_valid = True
+            print("🔄 [LoginBot] 等待扫码中...", end="", flush=True)
+            
             while qr_is_valid and (time.time() - start_time < max_duration):
                 status, data = self.check_qr_status(qrid)
                 
                 if status == 1:
-                    print("✅ 扫码成功！正在获取最终 Cookie...")
+                    print("\n✅ [LoginBot] 扫码成功！正在获取最终 Cookie...")
                     final_sub = self.login_and_get_sub(data)
                     if final_sub:
                         return final_sub
                     else:
-                        qr_is_valid = False # 失败重试
+                        print("\n❌ [LoginBot] 扫码成功但获取 SUB 失败，重试...")
+                        qr_is_valid = False 
                         
                 elif status == 2:
-                    print("⚠️ 二维码已过期，正在刷新...")
+                    print("\n⚠️ [LoginBot] 二维码已过期，正在刷新...")
                     qr_is_valid = False # 跳出内循环，获取新码
                     
                 else:
-                    time.sleep(2) # 继续等待
+                    # 等待中
+                    # print(".", end="", flush=True)
+                    time.sleep(2) 
+            print("") # 换行
                     
-        print("⏰ 登录超时，退出。")
+        print("\n⏰ [LoginBot] 登录超时，退出。")
         return None
+
+if __name__ == "__main__":
+    # 本地测试用
+    bot = WeiboQRLogin()
+    sub = bot.run_login_process()
+    if sub:
+        print(f"Got Cookie: {sub}")
