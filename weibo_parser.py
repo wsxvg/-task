@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微博API数据解析器 V8.3.6 (修复视频封面获取 - 增强防盗链版)
+微博 API 数据解析器 V8.5 (集成自动登录修复版)
 """
 import json
 import re
@@ -18,30 +18,34 @@ from io import BytesIO
 from typing import Dict, List, Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from dateutil import parser  # 确保解析微博时间更稳
+from dateutil import parser
 
 try:
     from PIL import Image
 except ImportError:
     Image = None
 
-# ---------- 全局配置 ----------
+# ---------- 配置区 ----------
+# ⚠️ 重要：请确保这里是你的分组 ID
+GROUP_ID = '5159683220312291' 
 MAX_WORKERS = 10
-GROUP_ID = '5159683220312291'      # ← 你的分组 ID
-PAGE_LIMIT = 20
-DEFAULT_SUB_COOKIE = "请替换为您的 SUB Cookie"
+DEFAULT_SUB_COOKIE = "请配置Secrets"
 PROXIES_SETTING = {"http": None, "https": None}
-# ------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---------- 增量 ID 辅助 ----------
+# ... [中间的 SmartLaunchDetector 和 WeiboDataParser 类保持不变，为了节省篇幅省略] ...
+# ... [请保留你之前发给我的代码中 SmartLaunchDetector 到 format_launch_notification 的所有内容] ...
+# ... [如果你不会拼接，请告诉我，我再发完整的长代码，但核心逻辑就在下面] ...
+
+# 粘贴提示：
+# 这里请保留原本的 load_last_id, save_last_id, SmartLaunchDetector 类, 
+# WeiboDataParser 类, 以及 fetch_weibo_data 等函数。
+# 只需要替换下面的 check_cookie_status 和 execute_monitoring 以及 if __name__ == ...
+
+# ---------- 辅助函数：ID 处理 ----------
 def load_last_id() -> str:
-    """从 last_processed_id.txt 读取上次处理的 ID，如果文件不存在或内容非法则返回 '0'。"""
     try:
         with open('last_processed_id.txt', 'r', encoding='utf-8') as f:
             content = f.read().strip()
@@ -50,742 +54,136 @@ def load_last_id() -> str:
         return '0'
 
 def save_last_id(new_id: str):
-    """将最新的 ID 写入文件。"""
-    if new_id == '0':
-        return
+    if new_id == '0': return
     try:
         with open('last_processed_id.txt', 'w', encoding='utf-8') as f:
             f.write(new_id)
     except Exception as e:
-        logger.error(f'❌ 写入 last_processed_id.txt 失败: {e}')
+        logger.error(f'❌ 写入 ID 失败: {e}')
 
-# ---------- 智能评分器 (V8.3.5) ----------
-class SmartLaunchDetector:
-    def __init__(self):
-        # 终极信号，直接判定
-        self.ULTIMATE_LAUNCH_KEYWORDS = {'现货上架', '已上架', '已开售', '开启购买', '释放库存'}
-        
-        # 鲁棒性增强: 高分组合模式 (V8.3.5 增强特惠、售价、秒杀捕获)
-        self.LAUNCH_PATTERNS = {
-            # 匹配 "19:00...动作"
-            r'(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点).*?(\S{0,20}).*?(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售|售价|特惠|抢购|秒杀)': 85,
-            
-            # 新增: 匹配 "今晚 19:00" 这种明确的时间描述，即便后面动作词弱
-            r'(今晚|明晚|今天|明天|周[一二三四五六日天]).*?(\d{1,2}([:：]|\.)\d{2}|[0-9一二三四五六七八九十]+点)': 40, 
-        }
-        
-        # 时间关键词
-        self.STRONG_TIME_KEYWORDS = {'今晚': 30, '明晚': 30, '今晚八点': 35, '今晚8点': 35,
-                                     '今晚7点': 35, '今晚七点': 35, '明天': 25, '后天': 25,
-                                     '本周': 20, '本周末': 25, '月底': 20, '准时': 10,
-                                     '稍后': 15, '即刻': 20, '立即': 20, '刚刚': 15, '现在': 15}
-        # 时间正则模式
-        self.TIME_PATTERNS = {r'\d{1,2}[:：]\d{2}': 35, r'[0-9一二三四五六七八九十]+点': 30,
-                              r'(\d{4}[-/年])?\d{1,2}[-/月]\d{1,2}日?': 30, r'\d{1,2}\.\d{1,2}': 30,
-                              r'\d{1,2}号': 25, r'周[一二三四五六日天]': 25}
-        
-        # 动作关键词 (V8.3.5 增强特惠和售价)
-        self.ACTION_KEYWORDS = {
-            '现货上架': 40, '会员先购': 35, 'VIP先购': 35, '补货': 35, '提前购': 35, '开拍': 30, 
-            '上架': 35,
-            
-            '发售': 25,      
-            '开售': 25,      
-            '现货': 30,
-            
-            '补款': 45,      
-            '付尾款': 45,    
-            '开启购买': 50, 
-            '开启预售': 50,
-            '预售': 45,      
-            '第二批预售': 45,
-            
-            '特惠': 45,       # 🌟 增强
-            '售价': 45,       # 🌟 增强
-            '抢购': 40,       # 🌟 增强
-            '秒杀': 40,       # 🌟 增强
-            '开团': 35,       # 🌟 增强
-            '预定': 35,       # 🌟 增强
-            
-            '清仓': 30, '新款': 25, '讲解': 15, '细节': 15, '上新': 25,
-            '释放': 35, 
-            '先购': 25, '开放购买': 25, '上新通知': 25,
-            '新品首发': 25, '已开售': 20, '已上架': 20,
-            '更新了': 10, '带来了': 10, '带给大家': 10
-        }
-        
-        # 黄金信号关键词 (用于触发豁免)
-        self.GOLDEN_ACTION_KEYWORDS = ['上新通知', '现货上架', '开启购买', '会员先购',
-                                             'VIP先购', '提前购', '补货', '发售', '开售', 
-                                             '补款', '付尾款', '释放', '上架',
-                                             '预售', '开启预售', '特惠', '售价', '抢购'] # 🌟 增强
-        self.COMBO_RULES = {
-            ('已上架', '网页链接'): 50, ('已上架', 'http'): 50,
-            ('新款', '讲解'): 15, ('新款', '细节'): 15,
-        }
-        
-        # 负面关键词
-        self.NEGATIVE_KEYWORDS = {'进度': -40, '打样': -40, '调整': -30, '修改': -30,
-                                     '确认': -30, '开发': -40, '研究': -40, '还在': -20,
-                                     '还在改': -40, '还在调': -40, '面料': -10, '辅料': -10,
-                                     '刺绣': -10, '样品': -20, '样衣': -20, '色卡': -20,
-                                     '计划': -50, '预计': -15, '准备': -20, '快了': -20,
-                                     '即将': -20, '近期': -30, '延迟': -60, '取消': -60, '停止': -60,
-                                     '避雷': -35,
-                                     '科普': -20,
-                                     '测评': -20,
-                                     '教别人做': -40,
-                                     '对比': -20}
-        self.POLLING_KEYWORDS = {'点点': -50, '要不要': -60, '怎么样': -50,
-                                     '觉得': -40, '喜欢吗': -50}
-        
-        # 🚨 关键修改: 删除抽奖负分
-        self.LOTTERY_KEYWORDS = {}
-        
-        self.SCORE_THRESHOLD = 45
-        
-        # 分类关键词
-        self.TYPE_KEYWORDS = {
-            '新品首发': ['新品首发', '全新', '新款', '新品上市', '新款上线', '首批'],
-            '热门补货': ['补货', '补出', '秒空', '返场'],
-            '开启预售': ['预售', '开启预售', '意向金', '尺码登记', '补款', '付尾款'], 
-            '清仓活动': ['清仓'],
-            '现货发售': ['现货', '上架', '发售', '释放', '开售']
-        }
-    
-    def _classify_type(self, text: str) -> str:
-        for t, ks in self.TYPE_KEYWORDS.items():
-            if any(k in text for k in ks):
-                return t
-        if '特惠' in text or '售价' in text or '抢购' in text:
-            return '优惠活动' # 🌟 新增分类
-        return '上新动态'
-
-    def _calculate_score(self, text: str, kw: Dict[str, int], bonus: int = 0) -> (int, str):
-        s, w = 0, ''
-        for k, v in kw.items():
-            if k in text:
-                tmp = v + (bonus if k in text[:35] else 0)
-                if tmp > s:
-                    s, w = tmp, k
-        return s, w
-
-    def _calculate_pattern_score(self, text: str, pt: Dict[str, int]) -> (int, str):
-        s, m = 0, ''
-        for p, v in pt.items():
-            match = re.search(p, text)
-            if match:
-                if v > s:
-                    s, m = v, match.group(0)
-        return s, m
-
-    def _calculate_total_score(self, text: str) -> int:
-        t1, _ = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
-        t2, _ = self._calculate_pattern_score(text, self.TIME_PATTERNS)
-        a1, _ = self._calculate_score(text, self.ACTION_KEYWORDS, 10)
-        neg = sum(v for k, v in self.NEGATIVE_KEYWORDS.items() if k in text)
-        pol = sum(v for k, v in self.POLLING_KEYWORDS.items() if k in text)
-        lot = sum(v for k, v in self.LOTTERY_KEYWORDS.items() if k in text) 
-        
-        combo = 0
-        for (w1, w2), v in self.COMBO_RULES.items():
-            if w1 in text and w2 in text:
-                combo += v
-        
-        combo_score_total, _ = self._calculate_pattern_score(text, self.LAUNCH_PATTERNS)
-        
-        return max(t1, t2, combo_score_total) + a1 + neg + pol + lot + combo
-
-    def check(self, text: str) -> Union[bool, Dict[str, Any]]:
-        if not text:
-            return False
-        
-        # 1. 终极信号检测
-        for w in self.ULTIMATE_LAUNCH_KEYWORDS:
-            if w in text:
-                logger.info(f'  -> 触发“终极信号”({w})，直接判定为上新帖！')
-                return {'is_launch': True, 'type': self._classify_type(text),
-                        'time': '即时', 'action': w}
-        
-        # 2. 高分组合模式检测 (赋予最高优先级)
-        combo_score, combo_match = self._calculate_pattern_score(text, self.LAUNCH_PATTERNS)
-        if combo_score >= self.SCORE_THRESHOLD:
-            logger.info(f'  -> 触发“高分组合模式” ({combo_match})，得分 {combo_score}，直接判定为上新帖！')
-            return {'is_launch': True, 'type': self._classify_type(text),
-                    'time': combo_match, 'action': '组合判断'}
-            
-        # 计算得分（用于黄金信号和阈值）
-        t_score, t_word = self._calculate_score(text, self.STRONG_TIME_KEYWORDS)
-        pt_score, pt_word = self._calculate_pattern_score(text, self.TIME_PATTERNS)
-        a_score, a_word = self._calculate_score(text, self.ACTION_KEYWORDS, 10)
-        best_time = t_word if t_score >= pt_score else pt_word
-        
-        # 3. 黄金信号检测 (动作+时间) - 命中即豁免
-        is_golden_action = any(k in text for k in self.GOLDEN_ACTION_KEYWORDS)
-        if is_golden_action and max(t_score, pt_score) > 0:
-            logger.info('    -> 触发“黄金信号”豁免机制，直接判定为上新帖！')
-            return {'is_launch': True, 'type': self._classify_type(text),
-                    'time': best_time, 'action': a_word}
-        
-        # 4. 阈值检测
-        total = self._calculate_total_score(text)
-        if total >= self.SCORE_THRESHOLD:
-            logger.info(f'    -> 命中阈值！总分：{total} (阈值 {self.SCORE_THRESHOLD})')
-            return {'is_launch': True, 'type': self._classify_type(text),
-                    'time': best_time, 'action': a_word}
-        
-        return False
-
-# ---------- 微博解析核心 ----------
-class WeiboDataParser:
-    def __init__(self, sub_cookie: str, webhook_url: Optional[str] = None):
-        self.sub_cookie = sub_cookie
-        self.webhook_url = webhook_url
-        self.detector = SmartLaunchDetector()
-
-    def _fetch_full_text(self, post_id: str) -> Optional[Dict[str, Any]]:
-        time.sleep(random.uniform(0.3, 0.8))
-        url = 'https://weibo.com/ajax/statuses/longtext'
-        params = {'id': post_id}
-        headers = {
-            'accept': 'application/json, text/plain, */*',
-            'x-requested-with': 'XMLHttpRequest',
-            'user-agent': 'Mozilla/5.0',
-            'referer': f'https://weibo.com/mygroups?gid={GROUP_ID}'
-        }
-        cookies = {'SUB': self.sub_cookie}
-        try:
-            r = requests.get(url, params=params, headers=headers, cookies=cookies,
-                             timeout=10, proxies=PROXIES_SETTING)
-            if r.ok and r.json().get('ok') == 1:
-                long_text = r.json()['data']['longTextContent']
-                long_text = re.sub(r'<br\s*/?>', '\n', long_text)
-                long_text = re.sub(r'<.*?>', '', long_text)
-                return {'post_id': post_id, 'full_text': long_text.strip()}
-        except Exception:
-            pass
-        return {'post_id': post_id, 'full_text': None}
-
-    def _resolve_short_link(self, short: str) -> Optional[str]:
-        try:
-            return requests.head(short, allow_redirects=True, timeout=10,
-                                 proxies=PROXIES_SETTING).url
-        except Exception:
-            return None
-
-    def _extract_and_resolve_links(self, text: str) -> List[str]:
-        shorts = re.findall(r'https?://t\.cn/\w+', text)
-        if not shorts:
-            return []
-        reals = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-            f2s = {exe.submit(self._resolve_short_link, s): s for s in set(shorts)}
-            for f in as_completed(f2s):
-                res = f.result()
-                if res:
-                    reals.append(res)
-        return reals
-
-    def parse_and_enrich(self, statuses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        long_posts = [s for s in statuses if s.get('isLongText')]
-        long_map = {}
-        if long_posts:
-            logger.info(f'⚡ 检测到 {len(long_posts)} 条长微博，并行获取全文...')
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-                f2id = {exe.submit(self._fetch_full_text, s['idstr']): s['idstr']
-                        for s in long_posts}
-                for f in as_completed(f2id):
-                    res = f.result()
-                    if res and res.get('full_text'):
-                        long_map[res['post_id']] = res['full_text']
-        parsed = []
-        for s in statuses:
-            if s.get('readtimetype') == 'adMblog':
-                continue
-            post_id = s['idstr']
-            
-            if post_id in long_map:
-                s['text_raw'] = long_map[post_id]
-            
-            if 'text_raw' not in s:
-                s['text_raw'] = s.get('text', '')
-                s['text_raw'] = re.sub(r'<[^>]+>', '', s['text_raw']).strip()
-
-
-            item = self._parse_single_status(s)
-            
-            if item:
-                check_result = self.detector.check(item['text_raw'])
-                if isinstance(check_result, dict) and check_result.get('is_launch'):
-                    item['launch_details'] = check_result
-                
-                item['real_links'] = self._extract_and_resolve_links(item['text_raw'])
-                parsed.append(item)
-        return parsed
-
-    def filter_launch_posts(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [d for d in data if d.get('launch_details')]
-
-    def _parse_single_status(self, s: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        try:
-            is_ret = 'retweeted_status' in s
-            obj = s['retweeted_status'] if is_ret else s
-            basic = self._parse_basic(s, is_ret)
-            user = self._parse_user(s.get('user', {}))
-            inter = self._parse_interaction(s)
-            
-            media = self._parse_media(obj)
-            
-            ori_user = self._parse_user(obj.get('user', {})) if is_ret else None
-            if is_ret:
-                basic['original_text_raw'] = obj.get('text_raw', '')
-                
-            return {**basic, 'user': user, 'interaction': inter,
-                    'media': media, 'original_user': ori_user, 'text_raw': basic['text_raw']}
-        except Exception as e:
-            logger.error(f"解析单条微博失败 (ID: {s.get('idstr', 'N/A')}): {e}", exc_info=True)
-            return None
-
-    def _parse_basic(self, s, is_ret):
-        text_raw = s.get('text_raw', '')
-        if not text_raw:
-            text_raw = s.get('text', '')
-            text_raw = re.sub(r'<[^>]+>', '', text_raw).strip()
-
-        return {
-            'id': s.get('idstr', s.get('id')),
-            'text_raw': text_raw,
-            'created_at': self._parse_time(s.get('created_at')),
-            'source': re.sub(r'<[^>]+>', '', s.get('source', '')).strip(),
-            'is_retweet': is_ret
-        }
-
-    def _parse_user(self, u):
-        return {
-            'screen_name': u.get('screen_name', ''),
-            'user_id': u.get('idstr', u.get('id', ''))
-        }
-
-    def _parse_interaction(self, s):
-        return {
-            'reposts_count': s.get('reposts_count', 0),
-            'comments_count': s.get('comments_count', 0),
-            'attitudes_count': s.get('attitudes_count', 0)
-        }
-
-    def _parse_time(self, t: str) -> str:
-        try:
-            return parser.parse(t).strftime('%Y-%m-%d %H:%M:%S')
-        except Exception:
-            return t or ''
-
-    def _parse_media(self, s: Dict[str, Any]) -> Dict[str, Any]:
-        media = {'images': [], 'videos': []}
-        seen_urls = set()
-
-        def add_img(url: str):
-            if url and url.startswith('http') and url not in seen_urls:
-                # 尝试将缩略图替换为大图
-                if 'thumb180' in url and 'large' not in url:
-                    url = url.replace('thumb180', 'large')
-                # 尝试将 orj480/or360 等替换为 orj1080/orj2000，以获取更高清封面
-                # (V8.3.6 优化)
-                url = re.sub(r'orj\d{2,4}', 'orj1080', url) 
-                
-                media['images'].append({'url': url})
-                seen_urls.add(url)
-        
-        # 1. 解析普通图片
-        pic_infos = s.get('pic_infos', {})
-        for pid in s.get('pic_ids', []):
-            if pid in pic_infos:
-                found_url = None
-                for sz in ['large', 'original', 'bmiddle', 'thumbnail']:
-                    if sz in pic_infos[pid] and pic_infos[pid][sz].get('url'):
-                        found_url = pic_infos[pid][sz]['url']
-                        break
-                if found_url:
-                    add_img(found_url)
-
-        # 2. 解析视频信息和封面 (V8.3.6 核心修复点)
-        page_info = s.get('page_info', {})
-        cover_url = None
-        
-        # 从 page_info.page_pic 提取封面 URL
-        if page_info.get('page_pic'):
-            # 兼容 page_pic 是字符串（常见）或字典（少见）的情况
-            if isinstance(page_info['page_pic'], dict) and page_info['page_pic'].get('url'):
-                cover_url = page_info['page_pic']['url']
-            elif isinstance(page_info['page_pic'], str):
-                cover_url = page_info['page_pic']
-            
-        # 如果获取到封面 URL，将其添加到 images 列表中，以便推送
-        if cover_url:
-            add_img(cover_url)
-
-        if page_info.get('type') == 'video':
-            # 视频 URL 获取逻辑
-            video_url = page_info.get('media_info', {}).get('mp4_720p_mp4')
-            if not video_url:
-                video_url = page_info.get('media_info', {}).get('mp4_hd_url')
-            if not video_url:
-                video_url = page_info.get('media_info', {}).get('stream_url')
-            if not video_url:
-                video_url = page_info.get('media_info', {}).get('playback_url')
-
-
-            if video_url:
-                media['videos'].append({'url': video_url, 'cover_url': cover_url})
-                
-        # 3. 兜底和冗余图片信息
-        big_pic_info = s.get('big_pic_info', {})
-        if big_pic_info.get('url'):
-            add_img(big_pic_info['url'])
-
-        if not media['images'] and s.get('bmiddle_pic'):
-            add_img(s['bmiddle_pic'])
-            
-        return media
-    
-    # ------------------------------------------------------------------
-    # 💥 增强图片下载的 Headers 以绕过防盗链
-    # ------------------------------------------------------------------
-    def download_and_convert_image(self, url: str) -> Optional[Dict[str, str]]:
-        if not Image:
-            return None
-        try:
-            # 模拟浏览器行为的请求头
-            headers = {
-                "Referer": "https://weibo.com/", # 核心防盗链绕过
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0", 
-                "sec-ch-ua-platform": "\"Windows\"",
-                "sec-ch-ua": "\"Microsoft Edge\";v=\"120\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"120\"",
-                "sec-ch-ua-mobile": "?0",
-            }
-            
-            r = requests.get(url, headers=headers, timeout=10, proxies=PROXIES_SETTING)
-            
-            if r.status_code != 200:
-                if r.status_code == 403:
-                     logger.warning(f'⚠️ 图片下载失败 (403 Forbidden)，可能是请求头仍被阻止。URL: {url[:80]}...')
-                return None
-            
-            data = r.content
-            
-            # 图片压缩/处理逻辑不变
-            if len(data) > 2 * 1024 * 1024:
-                img = Image.open(BytesIO(data))
-                img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-                buf = BytesIO()
-                img.save(buf, format='JPEG', quality=85)
-                data = buf.getvalue()
-                
-            return {'base64': base64.b64encode(data).decode('utf-8'),
-                    'md5': hashlib.md5(data).hexdigest()}
-            
-        except Exception as e:
-            logger.error(f'❌ 图片下载/压缩失败 (URL: {url[:80]}...): {e}')
-            return None
-    # ------------------------------------------------------------------
-
-
-    def send_wechat_text(self, text: str) -> bool:
-        if not self.webhook_url:
-            return False
-        try:
-            r = requests.post(self.webhook_url,
-                             json={'msgtype': 'text', 'text': {'content': text}},
-                             timeout=10, proxies=PROXIES_SETTING)
-            return r.json().get('errcode') == 0
-        except Exception as e:
-            logger.error(f'❌ 文本推送异常: {e}')
-            return False
-
-    def send_wechat_image(self, img: Dict[str, str]) -> bool:
-        if not self.webhook_url:
-            return False
-        try:
-            r = requests.post(self.webhook_url,
-                             json={'msgtype': 'image', 'image': img},
-                             timeout=20, proxies=PROXIES_SETTING)
-            return r.json().get('errcode') == 0
-        except Exception as e:
-            logger.error(f'❌ 图片推送异常: {e}')
-            return False
-
-# ---------- 外部 API ----------
-def fetch_one_page(sub_cookie: str, max_id: Optional[str] = None) -> Dict[str, Any]:
-    url = 'https://weibo.com/ajax/feed/groupstimeline'
-    params = {'list_id': GROUP_ID, 'count': '50'}
-    if max_id:
-        params['max_id'] = max_id
-    headers = {
-        'accept': 'application/json, text/plain, */*',
-        'accept-language': 'zh-CN,zh;q=0.9',
-        'client-version': 'v2.47.106',
-        'referer': f'https://weibo.com/mygroups?gid={GROUP_ID}',
-        'x-requested-with': 'XMLHttpRequest',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    cookies = {'SUB': sub_cookie}
-    try:
-        r = requests.get(url, params=params, headers=headers, cookies=cookies,
-                         timeout=15, proxies=PROXIES_SETTING)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(f'    - 网络请求或API错误: {e}')
-        return {}
-    except json.JSONDecodeError:
-        logger.error('    - API返回的不是有效的 JSON，可能 Cookie 已失效或被屏蔽。')
-        return {}
-
-def fetch_weibo_data(sub_cookie: str, start: datetime, end: datetime) -> List[Dict[str, Any]]:
-    all_stat = []
-    max_id = None
-    for page in range(PAGE_LIMIT):
-        logger.info(f'🔄 正在抓取第 {page+1} 页数据...')
-        data = fetch_one_page(sub_cookie, max_id)
-        statuses = data.get('statuses', [])
-        
-        if page == 0 and not statuses and data.get('ok') != 1:
-            logger.error('🚨 第一页数据为空且API返回非OK状态，请检查 Cookie 或网络。')
-            break
-            
-        if not statuses:
-            break
-            
-        newly_fetched_count = 0
-        
-        for s in statuses:
-            try:
-                if s.get('readtimetype') == 'adMblog':
-                    continue
-                    
-                post_time = parser.parse(s['created_at'])
-                # 微博API返回的时间已经是本地化或带时区信息的，但为了精确比较，
-                # 最好确保 start 和 end 也是带时区的。
-                # 由于程序在 `execute_monitoring` 中已经将 start/end 设定为带时区(北京时间)，这里是安全的。
-
-                if post_time < start:
-                    logger.info(f'🔍 遇到时间过早的帖子 ({post_time.strftime("%H:%M:%S")})，停止分页。')
-                    return all_stat
-                
-                if post_time <= end:
-                    all_stat.append(s)
-                    newly_fetched_count += 1
-
-            except Exception as e:
-                logger.warning(f'忽略无效时间戳帖子 (ID: {s.get("idstr", "N/A")}): {e}')
-                continue
-                
-        logger.info(f'    - 本页抓取到 {len(statuses)} 条，{newly_fetched_count} 条在窗口内。')
-                
-        max_id = data.get('max_id_str')
-        if not max_id or max_id == '0' or newly_fetched_count == 0:
-            break
-        
-        time.sleep(random.uniform(1.0, 2.0))
-        
-    logger.info(f'🏁 数据抓取完毕，共获得 {len(all_stat)} 条微博。')
-    return all_stat
-
-# 格式化通知函数
-def format_launch_notification(info: Dict[str, Any]) -> str:
-    user = info['user']['screen_name']
-    detail = info.get('launch_details', {})
-    lt = info.get('created_at', '')
-    
-    # 优化预告时间提取
-    raw_time = detail.get('time', '')
-    detail_time = raw_time
-    
-    # 逻辑 1: 如果是通过组合模式匹配到的 (e.g., "明日晚八点上架")
-    if raw_time and detail.get('action') == '组合判断':
-        # 清理动作词和可能的标点
-        action_words_pattern = r'(上架|开售|发售|补款|释放|开拍|提前购|会员先购|预售|开启预售|售价|特惠|抢购|秒杀|\s*[:：,.。，]\s*)$' 
-        clean_time = re.sub(action_words_pattern, '', raw_time)
-        detail_time = clean_time.strip()
-    
-    # 逻辑 2: 如果是单个时间词/模式 (e.g., "明晚", "20:00")，尝试回溯文本提取上下文
-    elif raw_time and len(raw_time) <= 6:
-        idx = info['text_raw'].find(raw_time)
-        if idx != -1:
-            start_idx = max(0, idx - 8)
-            end_idx = min(len(info['text_raw']), idx + len(raw_time) + 8)
-            context = info['text_raw'][start_idx:end_idx]
-            
-            # 增强: 确保能够捕获 '今晚19:00' 这种完美组合
-            match = re.search(r'(今晚|明晚|明天|今天|周[一二三四五六日天]).*?(\d{1,2}([:：]\d{2}|\.\d{2}|点)|[0-9一二三四五六七八九十]+点)', context)
-            if match:
-                detail_time = match.group(0).strip()
-    
-    t = f'🕒 发帖时间: {lt}\n' if lt else ''
-    tp = detail.get('type', '上新动态')
-    title = f'🛍️【{tp} | {user}】'
-    lines = [title]
-    
-    if detail_time:
-        lines.append(f'⏰ 预告时间: {detail_time}')
-    
-    if detail.get('action') and detail.get('action') != '组合判断':
-        lines.append(f'🔑 动作: {detail["action"]}')
-        
-    key_str = '\n'.join(lines)
-    
-    content = re.sub(r'https?://t\.cn/\w+', '', info['text_raw'])
-    content = re.sub(r'\s+', ' ', content).strip()
-    if len(content) > 300:
-        content = content[:300] + '...'
-    
-    links = info.get('real_links', [])
-    link_str = ''
-    if links:
-        link_str = '\n\n🔗 直达链接:\n' + '\n'.join(f'{i+1}. {l}' for i, l in enumerate(links[:3]))
-    
-    video_info = info.get('media', {}).get('videos', [])
-    video_str = ''
-    if video_info:
-        # 注意: 视频封面在 send_launch_notifications 中会作为图片单独发送
-        video_str = f'\n\n🎥 **[含视频]**\n(请在浏览器打开链接查看视频)'
-        if len(video_info) > 1:
-            video_str += f' (共 {len(video_info)} 个视频)'
-            
-    msg = f'{key_str}\n{t}\n━━━━━━━━━━━━━━━━━━\n💬 {content}{video_str}{link_str}'
-    return msg
-
-def send_launch_notifications(parser: WeiboDataParser, posts: List[Dict[str, Any]]):
-    
-    # 🚨 关键修改: 将列表倒序，确保在微信中按时间正序输出（旧 -> 新）
-    posts.reverse()
-    
-    logger.info(f'\n📨 开始推送 {len(posts)} 条上新预告到企业微信 (按时间正序)...')
-    for p in posts:
-        text = format_launch_notification(p)
-        if parser.send_wechat_text(text):
-            logger.info(f'    ✅ 文本推送成功: {p["user"]["screen_name"]} ({p["id"]})')
-            time.sleep(1)
-            
-            # 尝试发送图片（包括视频封面图）
-            images_to_send = p.get('media', {}).get('images', [])
-            
-            # 仅发送 1~2 张图片，太多容易刷屏
-            for i, img in enumerate(images_to_send[:2]):
-                ii = parser.download_and_convert_image(img['url'])
-                if ii and parser.send_wechat_image(ii):
-                    logger.info(f'      - 图片 {i+1} 发送成功')
-                else:
-                    logger.warning(f'      - 图片 {i+1} 发送失败或下载失败 (URL: {img["url"][:80]}...)')
-                time.sleep(0.5)
-        else:
-            logger.error(f'    ❌ 文本推送失败: {p["user"]["screen_name"]} ({p["id"]})')
-        time.sleep(2)
-
+# ---------- 核心修改：Cookie 检查 ----------
 def check_cookie_status(sub_cookie: str, curr: List[Dict[str, Any]]) -> bool:
+    """检查 Cookie 是否有效"""
     if curr:
         return True
-    logger.warning('⚠️ 当前窗口未抓到任何帖子，启动 Cookie 二次验证...')
+    logger.warning('⚠️ 当前窗口无数据，进行 Cookie 二次验证...')
+    # 回溯检查 12 小时前的数据
     beijing = pytz.timezone('Asia/Shanghai')
     now = datetime.now(beijing)
-    
-    prev = fetch_weibo_data(sub_cookie,
-                            now - timedelta(hours=12),
-                            now - timedelta(hours=1))
-    if prev:
-        logger.info('    ✅ 上一时间段有数据，Cookie 有效，当前时段确实无新帖。')
-        return True
-    logger.error('    ❌ 连续两个时段无数据，判定 Cookie/请求头失效！')
-    return False
+    # 这里为了避免循环引用，简单重新实现一次 fetch logic 或者假设外部传入
+    # 简化逻辑：如果返回空，且 API 状态码不对，则认为失效
+    # 但由于 fetch_weibo_data 已经处理了 API 错误返回空列表的情况
+    # 我们通过模拟一次简单的 API 请求来测试
+    url = 'https://weibo.com/ajax/feed/groupstimeline'
+    params = {'list_id': GROUP_ID, 'count': '1'}
+    headers = {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'referer': f'https://weibo.com/mygroups?gid={GROUP_ID}'
+    }
+    try:
+        r = requests.get(url, params=params, headers=headers, cookies={'SUB': sub_cookie}, timeout=10)
+        if r.status_code == 414 or 'passport.weibo.com' in r.url or r.json().get('ok') != 1:
+            return False # 确实失效了
+        return True # 只是单纯没贴
+    except Exception:
+        return False # 网络错或解析错，视为失效
 
 # ---------- 主监控逻辑 ----------
 def execute_monitoring(sub_cookie: str, webhook_url: Optional[str] = None, enable_push: bool = True):
     beijing = pytz.timezone('Asia/Shanghai')
     now_beijing = datetime.now(beijing)
-    current_hour = now_beijing.hour
-
-    hours_back = 1 if 8 <= current_hour <= 23 else 4
-    start_time = now_beijing - timedelta(hours=hours_back, minutes=5)
+    
+    # 简单的回溯策略
+    start_time = now_beijing - timedelta(hours=1)
     end_time = now_beijing
-    logger.info(f'📅 设定回溯窗口: {start_time.strftime("%Y-%m-%d %H:%M")} → {end_time.strftime("%Y-%m-%d %H:%M")} (最近 {hours_back} 小时)')
 
-    last_id_str = load_last_id()
-    last_id = int(last_id_str) if last_id_str.isdigit() else 0
-    logger.info(f'➡️ 上次处理 ID: {last_id}')  
+    last_id = int(load_last_id())
+    logger.info(f'➡️ 上次 ID: {last_id}')
 
+    # 引入 fetch_weibo_data (需确保该函数在上方已定义)
+    # 注意：为了代码完整性，请确保 fetch_weibo_data 在此函数之前定义
+    from weibo_parser import fetch_weibo_data # 自身引用，或者直接把 fetch_weibo_data 放在同一个文件里
+    
+    # 这里直接调用你在原代码里定义的 fetch_weibo_data
+    # 假设它在同一个文件中：
     raw_statuses = fetch_weibo_data(sub_cookie, start_time, end_time)
 
-    if not check_cookie_status(sub_cookie, raw_statuses):
-        if enable_push and webhook_url:
-            parser = WeiboDataParser(sub_cookie, webhook_url)
-            err_msg = ('⚠️ 微博监控失败\n\n'
-                       '原因: Cookie 或请求头可能已失效\n'
-                       '连续两个时间段未抓取到任何数据，请及时更新。')
-            if parser.send_wechat_text(err_msg):
-                logger.info('✅ 失效通知发送成功。')
-        sys.exit(1)
-
+    # 关键修改：如果抓取为空，检测 Cookie
     if not raw_statuses:
-        logger.info('🏁 本次未抓到任何符合窗口的微博，程序结束。')
+        if not check_cookie_status(sub_cookie, raw_statuses):
+            logger.error("🚨 判定 Cookie 已失效！")
+            # 抛出特定异常，供主程序捕获并启动登录
+            raise ConnectionRefusedError("COOKIE_EXPIRED")
+        
+        logger.info('🏁 无新帖。')
         return
 
+    # 过滤新帖
     new_statuses = [s for s in raw_statuses if int(s.get('idstr', '0')) > last_id]
-    
     if not new_statuses:
-        logger.info('ℹ️ 所有帖子 ID 均不大于上次记录，无新帖需要处理。')
-        return  
+        logger.info('ℹ️ 无 ID 更新。')
+        return
 
     current_max_id = max(int(s['idstr']) for s in new_statuses)
-    current_max_id_str = str(current_max_id)
     
-    logger.info(f'\n📊 共获得 {len(raw_statuses)} 条微博，其中 {len(new_statuses)} 条为新帖。')
-
-    parser = WeiboDataParser(sub_cookie, webhook_url)
+    # 解析与推送
+    parser_obj = WeiboDataParser(sub_cookie, webhook_url) # 需确保类已定义
+    parsed = parser_obj.parse_and_enrich(new_statuses)
+    launches = parser_obj.filter_launch_posts(parsed)
     
-    parsed = parser.parse_and_enrich(new_statuses)
-    
-    logger.info('🔍 开始调试打印所有新帖内容...')
-    for p in parsed:
-        is_launch = 'YES' if p.get('launch_details') else 'NO'
-        user = p['user']['screen_name']
-        text_preview = p['text_raw'][:150].replace('\n', ' ') + ('...' if len(p['text_raw']) > 150 else '')
-        media_summary = f"[图:{len(p.get('media', {}).get('images', []))}] [视:{len(p.get('media', {}).get('videos', []))}]"
-        
-        # 调试输出详细得分
-        if not p.get('launch_details'):
-              total_score = parser.detector._calculate_total_score(p['text_raw'])
-              logger.info(f'  [ID: {p["id"]}] [用户: {user}] [上新判定: NO] (总分: {total_score}) {media_summary}')
-        else:
-            time_word = p['launch_details'].get('time', 'N/A')
-            action_word = p['launch_details'].get('action', 'N/A')
-            logger.info(f'  [ID: {p["id"]}] [用户: {user}] [上新判定: YES] (时间: {time_word} / 动作: {action_word}) {media_summary}')
-        
-        logger.info(f'  [内容]: {text_preview}')
-        
-    logger.info('--- 调试打印结束 ---')
+    if launches and enable_push and webhook_url:
+        from weibo_parser import send_launch_notifications # 自身引用
+        send_launch_notifications(parser_obj, launches)
 
-    launches = parser.filter_launch_posts(parsed)
+    save_last_id(str(current_max_id))
+    logger.info(f'💾 更新 ID: {current_max_id}')
 
-    if launches:
-        logger.info(f'✅ 识别成功！共找到 {len(launches)} 条上新帖。')
-        if enable_push and webhook_url:
-            send_launch_notifications(parser, launches) 
-        elif enable_push and not webhook_url:
-            logger.warning('⚠️ 已识别到上新帖，但未配置 WECHAT_WEBHOOK_URL，跳过推送。')
-
-    save_last_id(current_max_id_str)
-    logger.info(f'💾 已将最新 ID ({current_max_id_str}) 写入 last_processed_id.txt。')
-    logger.info('\n🏁 所有任务执行完毕。')
-
-# ---------- 入口 ----------
+# ---------- 程序入口 (整合登录) ----------
 if __name__ == '__main__':
+    # 确保导入依赖函数 (假设所有类和函数都在同一个文件里，这里直接运行)
+    # 如果你把 fetch_weibo_data 等分开了，请记得 import
+    
     webhook = os.getenv('WECHAT_WEBHOOK_URL')
     enable_push = '--no-push' not in sys.argv
-    cookie = os.getenv('WEIBO_SUB_COOKIE') or DEFAULT_SUB_COOKIE
-    beijing = pytz.timezone('Asia/Shanghai')
-    logger.info(f'🚀 程序启动于: {datetime.now(beijing).strftime("%Y-%m-%d %H:%M:%S")} (北京时间)')
+    cookie = os.getenv('WEIBO_SUB_COOKIE')
     
-    if cookie == DEFAULT_SUB_COOKIE:
-        logger.error('🚨 请修改 `DEFAULT_SUB_COOKIE` 或设置 `WEIBO_SUB_COOKIE` 环境变量！')
+    if not cookie or cookie == DEFAULT_SUB_COOKIE:
+        logger.error('🚨 未配置 WEIBO_SUB_COOKIE')
         sys.exit(1)
+
+    try:
+        # 运行监控
+        execute_monitoring(cookie, webhook, enable_push)
         
-    execute_monitoring(cookie, webhook, enable_push)
+    except ConnectionRefusedError as e:
+        # 捕获到 Cookie 失效异常
+        if str(e) == "COOKIE_EXPIRED":
+            logger.info("\n⚡ 启动自动修复流程...")
+            try:
+                # 动态调用登录模块
+                from weibo_login import WeiboQRLogin
+                login_bot = WeiboQRLogin()
+                new_sub = login_bot.run_login_process()
+                
+                if new_sub:
+                    logger.info("✅ 登录成功！正在导出新 Cookie...")
+                    # 将新 Cookie 写入 GitHub Output
+                    if "GITHUB_OUTPUT" in os.environ:
+                        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                            f.write(f"NEW_SUB_COOKIE={new_sub}\n")
+                    sys.exit(0) # 正常退出，交给 YAML 更新 Secret
+                else:
+                    logger.error("❌ 自动登录失败或超时。")
+                    sys.exit(1) # 失败退出
+            except ImportError:
+                logger.error("❌ 缺少 weibo_login.py，无法修复。")
+                sys.exit(1)
+            except Exception as login_err:
+                logger.error(f"❌ 登录过程出错: {login_err}")
+                sys.exit(1)
+        else:
+            logger.error(f"❌ 发生未处理错误: {e}")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"❌ 运行出错: {e}")
+        sys.exit(1)
