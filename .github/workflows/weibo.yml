@@ -1,80 +1,63 @@
-name: 🛒 微博抢购增量监控 V8.5 (自动保活版)
+name: 🛒 微博监控与保活 (Debug版)
 
 on:
   schedule:
-    # 每 5 分钟运行一次
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
-
-concurrency:
-  group: weibo-check
-  cancel-in-progress: true
+    - cron: '*/10 * * * *' # 每10分钟一次
+  workflow_dispatch:       # 支持手动点击运行
 
 permissions:
-  contents: write # 允许提交代码
+  contents: write          # 允许提交代码(保存id)
 
 env:
   TZ: Asia/Shanghai
 
 jobs:
-  monitor_and_fix:
+  monitor_task:
     runs-on: ubuntu-latest
-    timeout-minutes: 20 
+    timeout-minutes: 20    # 足够扫码登录的时间
 
     steps:
       - name: 1. 检出代码
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref_name }}
-          fetch-depth: 0 
 
-      - name: 2. 设置 Python 3.12
+      - name: 2. 设置 Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.12"
+          python-version: "3.10"
 
       - name: 3. 安装依赖
         run: |
-          pip install --no-cache-dir requests pillow pytz python-dateutil
+          pip install requests pytz python-dateutil
 
-      - name: 4. 运行监控 (自动修复模式)
-        id: weibo_task
-        # 允许失败继续，因为 Python 脚本会通过 output 传递新 cookie
-        # 即使 Python 最终 exit(0) 成功，我们也要检查 outputs
+      - name: 4. 运行监控脚本
+        id: weibo_run
+        # 即使出错也继续，因为可能是 Cookie失效导致的退出，我们需要检查 output
         continue-on-error: true 
-        run: python weibo_parser.py
         env:
-          TZ: Asia/Shanghai
+          # 必须在 Settings -> Secrets and variables -> Actions 中配置
           WEIBO_SUB_COOKIE: ${{ secrets.WEIBO_SUB_COOKIE }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
-
-      - name: 5. 自动更新 Secret (若获取到新Cookie)
-        # 仅当第4步输出了 NEW_SUB_COOKIE 时执行
-        if: steps.weibo_task.outputs.NEW_SUB_COOKIE != ''
-        env:
-          # ⚠️ 必须使用你申请的 Personal Access Token (PA_TOKEN)
-          GH_TOKEN: ${{ secrets.PA_TOKEN }} 
-          NEW_COOKIE: ${{ steps.weibo_task.outputs.NEW_SUB_COOKIE }}
         run: |
-          echo "检测到新 Cookie，正在更新仓库密钥..."
+          python weibo_parser.py
+
+      - name: 5. [关键] 自动更新 Secret (如果有新Cookie)
+        if: steps.weibo_run.outputs.NEW_SUB_COOKIE != ''
+        env:
+          # ⚠️ 这里必须使用 Personal Access Token (PAT)，否则无法更新 Secrets
+          GH_TOKEN: ${{ secrets.PA_TOKEN }} 
+          NEW_COOKIE: ${{ steps.weibo_run.outputs.NEW_SUB_COOKIE }}
+        run: |
+          echo "🔄 正在通过 GitHub CLI 更新 Secrets..."
           gh secret set WEIBO_SUB_COOKIE --body "$NEW_COOKIE"
           echo "✅ Secret 更新成功！下次运行将生效。"
 
-      - name: 6. 提交 ID 进度 (若监控正常运行)
-        # 只有当 Python 脚本成功执行且不是因为 cookie 错误退出时
-        if: steps.weibo_task.outcome == 'success'
+      - name: 6. 提交 ID 进度
+        if: steps.weibo_run.outcome == 'success'
         run: |
           git config user.name "GitHub Actions Bot"
           git config user.email "actions-bot@users.noreply.github.com"
-          
           if [ -f last_processed_id.txt ]; then
-             if git diff --exit-code last_processed_id.txt; then
-               echo "无 ID 更新。"
-             else
-               git add last_processed_id.txt
-               git commit -m "🤖 Chore: Update last_id"
-               git push
-             fi
+             git add last_processed_id.txt
+             git commit -m "💾 Update processed ID" || echo "无变更"
+             git push
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
